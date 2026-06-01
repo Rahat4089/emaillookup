@@ -57,6 +57,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print step plan only; do not send network requests.",
     )
+    parser.add_argument(
+        "--human-verification-token",
+        type=str,
+        default=None,
+        help="Optional Proton human verification token (if CAPTCHA is required).",
+    )
+    parser.add_argument(
+        "--human-verification-method",
+        type=str,
+        default="captcha",
+        help="Method for the human verification token header (default: captcha).",
+    )
     return parser.parse_args()
 
 
@@ -81,39 +93,11 @@ def json_or_text(response: requests.Response) -> str:
     return body
 
 
-def print_exchange(
-    name: str,
-    method: str,
-    url: str,
-    req_headers: dict[str, str] | None,
-    req_body: Any,
-    response: requests.Response | None,
-    *,
-    dry_run: bool = False,
-) -> None:
-    print("=" * 100)
-    print(f"STEP: {name}")
-    print(f"REQUEST: {method.upper()} {url}")
-    print("REQUEST HEADERS:")
-    for key, value in (req_headers or {}).items():
-        print(f"  {key}: {value}")
-    if req_body is None:
-        print("REQUEST BODY: <none>")
-    else:
-        if isinstance(req_body, (dict, list)):
-            print("REQUEST BODY:")
-            print(json.dumps(req_body, indent=2, ensure_ascii=False))
-        else:
-            print(f"REQUEST BODY: {req_body}")
-
-    if dry_run:
-        print("DRY-RUN: request not sent")
-        return
-
+def print_response_only(name: str, response: requests.Response | None) -> None:
     if response is None:
-        print("RESPONSE: <none>")
         return
-
+    print("-" * 100)
+    print(f"STEP RESULT: {name}")
     print(f"RESPONSE STATUS: {response.status_code} {response.reason}")
     print("RESPONSE HEADERS:")
     for key, value in response.headers.items():
@@ -133,16 +117,20 @@ def do_request(
     timeout: float = 30.0,
     dry_run: bool = False,
 ) -> requests.Response | None:
-    print_exchange(
-        name=name,
-        method=method,
-        url=url,
-        req_headers=headers,
-        req_body=json_body,
-        response=None,
-        dry_run=dry_run,
-    )
+    print("=" * 100)
+    print(f"STEP: {name}")
+    print(f"REQUEST: {method.upper()} {url}")
+    print("REQUEST HEADERS:")
+    for key, value in (headers or {}).items():
+        print(f"  {key}: {value}")
+    if json_body is None:
+        print("REQUEST BODY: <none>")
+    else:
+        print("REQUEST BODY:")
+        print(json.dumps(json_body, indent=2, ensure_ascii=False))
+
     if dry_run:
+        print("DRY-RUN: request not sent")
         return None
 
     response = session.request(
@@ -152,19 +140,17 @@ def do_request(
         json=json_body,
         timeout=timeout,
     )
-    # Re-print with response details.
-    print_exchange(
-        name=name,
-        method=method,
-        url=url,
-        req_headers=headers,
-        req_body=json_body,
-        response=response,
-    )
+    print_response_only(name, response)
     return response
 
 
-def default_headers(*, uid: str | None = None, include_auth: str | None = None) -> dict[str, str]:
+def default_headers(
+    *,
+    uid: str | None = None,
+    include_auth: str | None = None,
+    human_verification_token: str | None = None,
+    human_verification_method: str | None = None,
+) -> dict[str, str]:
     headers = {
         "accept": ACCEPT,
         "x-pm-appversion": APP_VERSION,
@@ -177,6 +163,10 @@ def default_headers(*, uid: str | None = None, include_auth: str | None = None) 
         headers["x-pm-uid"] = uid
     if include_auth:
         headers["authorization"] = f"Bearer {include_auth}"
+    if human_verification_token:
+        headers["x-pm-human-verification-token"] = human_verification_token
+    if human_verification_method:
+        headers["x-pm-human-verification-token-type"] = human_verification_method
     return headers
 
 
@@ -396,7 +386,23 @@ def require_json(response: requests.Response, step: str) -> dict[str, Any]:
     return data
 
 
-def run_flow(email: str, password: str, *, intent: str, timeout: float, skip_challenge: bool, dry_run: bool) -> int:
+def require_success_code(payload: dict[str, Any], step: str) -> None:
+    code = payload.get("Code")
+    if code != 1000:
+        raise RuntimeError(f"{step}: unexpected API code {code} payload={json.dumps(payload)}")
+
+
+def run_flow(
+    email: str,
+    password: str,
+    *,
+    intent: str,
+    timeout: float,
+    skip_challenge: bool,
+    dry_run: bool,
+    human_verification_token: str | None,
+    human_verification_method: str | None,
+) -> int:
     session = requests.Session()
     session.headers.update(
         {
@@ -460,13 +466,14 @@ def run_flow(email: str, password: str, *, intent: str, timeout: float, skip_cha
         return 0
 
     create_session_json = require_json(create_session_resp, "Create unauth session")
+    require_success_code(create_session_json, "Create unauth session")
     tokens = SessionTokens(
         access_token=create_session_json["AccessToken"],
         refresh_token=create_session_json["RefreshToken"],
         uid=create_session_json["UID"],
     )
 
-    info_headers = default_headers(uid=tokens.uid)
+    info_headers = default_headers(uid=tokens.uid, include_auth=tokens.access_token)
     auth_info_resp = do_request(
         session,
         name="Get auth info",
@@ -477,17 +484,24 @@ def run_flow(email: str, password: str, *, intent: str, timeout: float, skip_cha
         timeout=timeout,
     )
     auth_info = require_json(auth_info_resp, "Get auth info")
+    require_success_code(auth_info, "Get auth info")
 
     client_ephemeral_b64, client_proof_b64, expected_server_proof = compute_srp_proofs(
         auth_info, username=email, password=password
     )
 
+    auth_headers = default_headers(
+        uid=tokens.uid,
+        include_auth=tokens.access_token,
+        human_verification_token=human_verification_token,
+        human_verification_method=human_verification_method if human_verification_token else None,
+    )
     auth_resp = do_request(
         session,
         name="Submit SRP auth",
         method="POST",
         url=f"{ACCOUNT_BASE}/api/core/v4/auth",
-        headers=info_headers,
+        headers=auth_headers,
         json_body={
             "ClientProof": client_proof_b64,
             "ClientEphemeral": client_ephemeral_b64,
@@ -498,6 +512,19 @@ def run_flow(email: str, password: str, *, intent: str, timeout: float, skip_cha
         timeout=timeout,
     )
     auth_json = require_json(auth_resp, "Submit SRP auth")
+    if auth_json.get("Code") == 9001:
+        details = auth_json.get("Details", {})
+        print("=" * 100)
+        print("Human verification required by Proton.")
+        print(f"Token: {details.get('HumanVerificationToken')}")
+        print(f"Methods: {details.get('HumanVerificationMethods')}")
+        print(f"Web URL: {details.get('WebUrl')}")
+        print(
+            "Re-run with --human-verification-token '<token>' "
+            "--human-verification-method captcha after completing verification."
+        )
+        return 2
+    require_success_code(auth_json, "Submit SRP auth")
     server_proof = auth_json.get("ServerProof")
     if server_proof and server_proof != expected_server_proof:
         raise RuntimeError("Server proof mismatch: login response could not be verified.")
@@ -540,6 +567,8 @@ def main() -> int:
             timeout=args.timeout,
             skip_challenge=args.skip_challenge,
             dry_run=args.dry_run,
+            human_verification_token=args.human_verification_token,
+            human_verification_method=args.human_verification_method,
         )
     except Exception as exc:  # pragma: no cover
         print(f"ERROR: {exc}", file=sys.stderr)

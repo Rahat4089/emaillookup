@@ -17,6 +17,8 @@ Optional flags:
 - `--intent Auto|Proton`: auth intent (default: `Proton`)
 - `--skip-challenge`: skip pre-login challenge/access calls
 - `--dry-run`: print all planned login steps without sending requests
+- `--human-verification-token <token>`: optional CAPTCHA verification token
+- `--human-verification-method <method>`: token method header (default: `captcha`)
 
 Example:
 

@@ -21,6 +21,8 @@ from typing import Any
 
 import bcrypt
 import requests
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 
 
 ACCOUNT_BASE = "https://account.proton.me"
@@ -47,11 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", type=str, help="Account password (if omitted, prompt)")
     parser.add_argument("--intent", choices=("Auto", "Proton"), default="Proton")
     parser.add_argument("--timeout", type=float, default=30.0)
-    parser.add_argument(
-        "--skip-challenge",
-        action="store_true",
-        help="Skip initial challenge/access preflight endpoints.",
-    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -139,6 +136,7 @@ def do_request(
         headers=headers,
         json=json_body,
         timeout=timeout,
+        verify=False,
     )
     print_response_only(name, response)
     return response
@@ -398,12 +396,12 @@ def run_flow(
     *,
     intent: str,
     timeout: float,
-    skip_challenge: bool,
     dry_run: bool,
     human_verification_token: str | None,
     human_verification_method: str | None,
 ) -> int:
     session = requests.Session()
+    session.verify = False
     session.headers.update(
         {
             "accept": ACCEPT,
@@ -415,40 +413,6 @@ def run_flow(
             ),
         }
     )
-
-    if not skip_challenge:
-        do_request(
-            session,
-            name="Challenge login page",
-            method="GET",
-            url=f"{CHALLENGE_BASE}/challenge/v4/html?Type=0&Name=login&Lang=en-US&Dir=ltr",
-            timeout=timeout,
-            dry_run=dry_run,
-        )
-        do_request(
-            session,
-            name="Challenge unauth page",
-            method="GET",
-            url=f"{CHALLENGE_BASE}/challenge/v4/html?Type=0&Name=unauth&Lang=en-US&Dir=ltr",
-            timeout=timeout,
-            dry_run=dry_run,
-        )
-        do_request(
-            session,
-            name="Access incoming preflight",
-            method="GET",
-            url=f"{ACCOUNT_BASE}/api/account/v1/access/incoming",
-            timeout=timeout,
-            dry_run=dry_run,
-        )
-        do_request(
-            session,
-            name="Access outgoing preflight",
-            method="GET",
-            url=f"{ACCOUNT_BASE}/api/account/v1/access/outgoing",
-            timeout=timeout,
-            dry_run=dry_run,
-        )
 
     session_headers = {"x-enforce-unauthsession": "true"}
     create_session_resp = do_request(
@@ -560,6 +524,44 @@ def run_flow(
     cookie_json = require_json(cookie_resp, "Exchange refresh token for cookies")
     require_success_code(cookie_json, "Exchange refresh token for cookies")
 
+    # Capture account data with the authenticated token only (no extra preflight endpoints).
+    account_headers = default_headers(
+        uid=authenticated_tokens.uid,
+        include_auth=authenticated_tokens.access_token,
+    )
+    users_resp = do_request(
+        session,
+        name="Capture account info: users",
+        method="GET",
+        url=f"{ACCOUNT_BASE}/api/core/v4/users",
+        headers=account_headers,
+        timeout=timeout,
+    )
+    users_json = require_json(users_resp, "Capture account info: users")
+    require_success_code(users_json, "Capture account info: users")
+
+    settings_resp = do_request(
+        session,
+        name="Capture account info: settings",
+        method="GET",
+        url=f"{ACCOUNT_BASE}/api/core/v4/settings",
+        headers=account_headers,
+        timeout=timeout,
+    )
+    settings_json = require_json(settings_resp, "Capture account info: settings")
+    require_success_code(settings_json, "Capture account info: settings")
+
+    addresses_resp = do_request(
+        session,
+        name="Capture account info: addresses",
+        method="GET",
+        url=f"{ACCOUNT_BASE}/api/core/v4/addresses?Page=0&PageSize=50",
+        headers=account_headers,
+        timeout=timeout,
+    )
+    addresses_json = require_json(addresses_resp, "Capture account info: addresses")
+    require_success_code(addresses_json, "Capture account info: addresses")
+
     print("=" * 100)
     print("Login flow completed.")
     print(f"UID: {authenticated_tokens.uid}")
@@ -568,6 +570,7 @@ def run_flow(
 
 
 def main() -> int:
+    urllib3.disable_warnings(InsecureRequestWarning)
     args = parse_args()
     try:
         email, password = prompt_credentials(args)
@@ -576,7 +579,6 @@ def main() -> int:
             password,
             intent=args.intent,
             timeout=args.timeout,
-            skip_challenge=args.skip_challenge,
             dry_run=args.dry_run,
             human_verification_token=args.human_verification_token,
             human_verification_method=args.human_verification_method,

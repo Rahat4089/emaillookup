@@ -1,386 +1,549 @@
 #!/usr/bin/env python3
 """
-Replay Proton login-related requests from a HAR capture.
+Reverse and execute Proton's full login flow (SRP-based), printing all responses.
 
-This script:
-1) asks for email/password (unless passed via args),
-2) replays login-related HAR requests in sequence,
-3) prints each response (status, headers, body).
-
-Note:
-Proton login uses SRP and cryptographic proofs. A plain password is usually
-not sent directly in requests. Replaying old HAR payloads may fail if tokens
-or proofs are expired.
+This script asks for email/password, performs the live auth flow, and prints each
+request/response pair so the full login process is observable.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
+import hashlib
 import json
-import re
+import secrets
+import string
 import sys
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlparse
 
+import bcrypt
 import requests
 
 
-EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-LOGIN_HINTS = (
-    "/challenge/",
-    "/api/account/v1/access/incoming",
-    "/api/account/v1/access/outgoing",
-    "/api/auth/",
-    "/api/core/v4/auth",
-    "/api/core/v4/auth/info",
-    "/api/core/v4/auth/cookies",
-    "/authorize?app=proton-vpn-browser-extension",
-)
-
-SKIP_HINTS = (
-    "/assets/static/",
-    "/api/data/v1/telemetry",
-    "/api/feature/v2/frontend/client/metrics",
-)
-
-BLOCKED_HEADERS = {
-    "host",
-    "content-length",
-    "connection",
-    "accept-encoding",
-    "cookie",
-}
+ACCOUNT_BASE = "https://account.proton.me"
+CHALLENGE_BASE = "https://account-api.proton.me"
+APP_VERSION = "web-account@5.0.382.0"
+ACCEPT = "application/vnd.protonmail.v1+json"
+LOCALE = "en_US"
+BCRYPT_PREFIX = b"$2y$10$"
+BCRYPT_ALPHABET = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-def load_har(path: Path) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("log", {}).get("entries", [])
-
-
-def detect_first_email(entries: list[dict[str, Any]]) -> str | None:
-    for entry in entries:
-        request = entry.get("request", {})
-        url = request.get("url", "")
-        match = EMAIL_REGEX.search(url)
-        if match:
-            return match.group(0)
-        post_data = request.get("postData", {}) or {}
-        text = post_data.get("text", "") or ""
-        match = EMAIL_REGEX.search(text)
-        if match:
-            return match.group(0)
-    return None
-
-
-def is_login_related(url: str) -> bool:
-    if any(skip in url for skip in SKIP_HINTS):
-        return False
-    return any(hint in url for hint in LOGIN_HINTS)
-
-
-def filter_entries(entries: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
-    if mode == "all":
-        return entries
-    return [entry for entry in entries if is_login_related(entry.get("request", {}).get("url", ""))]
-
-
-def sanitize_headers(headers: list[dict[str, str]]) -> dict[str, str]:
-    clean: dict[str, str] = {}
-    for item in headers:
-        name = item.get("name", "")
-        value = item.get("value", "")
-        if not name or name.startswith(":"):
-            continue
-        if name.lower() in BLOCKED_HEADERS:
-            continue
-        clean[name] = value
-    return clean
-
-
-def replace_credentials_in_string(
-    value: str,
-    *,
-    email: str,
-    password: str,
-    captured_email: str | None,
-    captured_password: str | None,
-) -> str:
-    replacement_map = {
-        captured_email: email,
-        quote(captured_email or ""): quote(email),
-        captured_password: password,
-    }
-    out = value
-    for old, new in replacement_map.items():
-        if old:
-            out = out.replace(old, new)
-    return out
-
-
-def replace_credentials_in_json(
-    value: Any,
-    *,
-    email: str,
-    password: str,
-    captured_email: str | None,
-    captured_password: str | None,
-) -> Any:
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, sub_value in value.items():
-            lower_key = key.lower()
-            if lower_key in {"username", "email", "login"} and isinstance(sub_value, str):
-                out[key] = email
-            elif lower_key in {"password", "pass", "passwd"} and isinstance(sub_value, str):
-                out[key] = password
-            else:
-                out[key] = replace_credentials_in_json(
-                    sub_value,
-                    email=email,
-                    password=password,
-                    captured_email=captured_email,
-                    captured_password=captured_password,
-                )
-        return out
-    if isinstance(value, list):
-        return [
-            replace_credentials_in_json(
-                item,
-                email=email,
-                password=password,
-                captured_email=captured_email,
-                captured_password=captured_password,
-            )
-            for item in value
-        ]
-    if isinstance(value, str):
-        return replace_credentials_in_string(
-            value,
-            email=email,
-            password=password,
-            captured_email=captured_email,
-            captured_password=captured_password,
-        )
-    return value
-
-
-def build_body(
-    post_data: dict[str, Any],
-    *,
-    email: str,
-    password: str,
-    captured_email: str | None,
-    captured_password: str | None,
-) -> str | bytes | None:
-    if not post_data:
-        return None
-
-    mime = (post_data.get("mimeType", "") or "").lower()
-    text = post_data.get("text", "")
-
-    if "application/json" in mime and text:
-        try:
-            parsed = json.loads(text)
-            replaced = replace_credentials_in_json(
-                parsed,
-                email=email,
-                password=password,
-                captured_email=captured_email,
-                captured_password=captured_password,
-            )
-            return json.dumps(replaced, separators=(",", ":"))
-        except json.JSONDecodeError:
-            return replace_credentials_in_string(
-                text,
-                email=email,
-                password=password,
-                captured_email=captured_email,
-                captured_password=captured_password,
-            )
-
-    if "application/x-www-form-urlencoded" in mime and post_data.get("params"):
-        pairs = []
-        for param in post_data.get("params", []):
-            name = param.get("name", "")
-            value = param.get("value", "")
-            value = replace_credentials_in_string(
-                value,
-                email=email,
-                password=password,
-                captured_email=captured_email,
-                captured_password=captured_password,
-            )
-            pairs.append(f"{quote(name)}={quote(value)}")
-        return "&".join(pairs)
-
-    if text:
-        return replace_credentials_in_string(
-            text,
-            email=email,
-            password=password,
-            captured_email=captured_email,
-            captured_password=captured_password,
-        )
-
-    return None
-
-
-def print_response(response: requests.Response) -> None:
-    print(f"Status: {response.status_code} {response.reason}")
-    print("Response headers:")
-    for name, value in response.headers.items():
-        print(f"  {name}: {value}")
-    print("Response body:")
-
-    content_type = response.headers.get("content-type", "").lower()
-    text = response.text
-    if "application/json" in content_type:
-        try:
-            parsed = response.json()
-            print(json.dumps(parsed, indent=2, ensure_ascii=False))
-        except json.JSONDecodeError:
-            print(text)
-    else:
-        print(text)
-    print("-" * 80)
-
-
-def replay_entries(
-    entries: list[dict[str, Any]],
-    *,
-    email: str,
-    password: str,
-    captured_email: str | None,
-    captured_password: str | None,
-    timeout: float,
-    dry_run: bool,
-) -> None:
-    session = requests.Session()
-    session.verify = True
-
-    for index, entry in enumerate(entries, start=1):
-        request = entry.get("request", {})
-        method = (request.get("method", "GET") or "GET").upper()
-        raw_url = request.get("url", "")
-        url = replace_credentials_in_string(
-            raw_url,
-            email=email,
-            password=password,
-            captured_email=captured_email,
-            captured_password=captured_password,
-        )
-        headers = sanitize_headers(request.get("headers", []))
-
-        parsed = urlparse(url)
-        for cookie in request.get("cookies", []):
-            name = cookie.get("name")
-            value = cookie.get("value")
-            if name and value is not None:
-                session.cookies.set(name, value, domain=parsed.hostname, path=cookie.get("path", "/"))
-
-        post_data = request.get("postData", {}) or {}
-        body = build_body(
-            post_data,
-            email=email,
-            password=password,
-            captured_email=captured_email,
-            captured_password=captured_password,
-        )
-
-        print(f"[{index}/{len(entries)}] {method} {url}")
-        if body is not None:
-            print(f"Request body: {body}")
-        else:
-            print("Request body: <none>")
-
-        if dry_run:
-            print("Dry-run mode: request not sent.")
-            print("-" * 80)
-            continue
-
-        try:
-            response = session.request(method=method, url=url, headers=headers, data=body, timeout=timeout)
-            print_response(response)
-        except requests.RequestException as exc:
-            print(f"Request failed: {exc}")
-            print("-" * 80)
+@dataclass
+class SessionTokens:
+    access_token: str
+    refresh_token: str
+    uid: str
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Replay login requests from a HAR file and print responses.")
+    parser = argparse.ArgumentParser(
+        description="Execute Proton full login flow and print all responses."
+    )
+    parser.add_argument("--email", type=str, help="Account email (if omitted, prompt)")
+    parser.add_argument("--password", type=str, help="Account password (if omitted, prompt)")
+    parser.add_argument("--intent", choices=("Auto", "Proton"), default="Proton")
+    parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
-        "--har",
-        type=Path,
-        default=Path("account-api.proton.me_2026_06_01_18_34_28.har"),
-        help="Path to HAR file.",
+        "--skip-challenge",
+        action="store_true",
+        help="Skip initial challenge/access preflight endpoints.",
     )
     parser.add_argument(
-        "--mode",
-        choices=("login", "all"),
-        default="login",
-        help="Replay only login-related entries (default) or all entries.",
+        "--dry-run",
+        action="store_true",
+        help="Print step plan only; do not send network requests.",
     )
-    parser.add_argument("--email", type=str, help="Email to use. If omitted, prompt interactively.")
-    parser.add_argument("--password", type=str, help="Password to use. If omitted, prompt interactively.")
-    parser.add_argument(
-        "--captured-email",
-        type=str,
-        default=None,
-        help="Email value that existed in the HAR. If omitted, auto-detected.",
-    )
-    parser.add_argument(
-        "--captured-password",
-        type=str,
-        default=None,
-        help="Password value that existed in the HAR (if any) for replacement.",
-    )
-    parser.add_argument("--timeout", type=float, default=30.0, help="Per-request timeout in seconds.")
-    parser.add_argument("--dry-run", action="store_true", help="Print requests without sending them.")
     return parser.parse_args()
+
+
+def prompt_credentials(args: argparse.Namespace) -> tuple[str, str]:
+    email = (args.email or input("Email: ").strip()).strip()
+    if not email:
+        raise ValueError("Email is required.")
+    password = args.password if args.password is not None else getpass.getpass("Password: ")
+    if not password:
+        raise ValueError("Password is required.")
+    return email, password
+
+
+def json_or_text(response: requests.Response) -> str:
+    content_type = response.headers.get("content-type", "").lower()
+    body = response.text
+    if "application/json" in content_type:
+        try:
+            return json.dumps(response.json(), indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            return body
+    return body
+
+
+def print_exchange(
+    name: str,
+    method: str,
+    url: str,
+    req_headers: dict[str, str] | None,
+    req_body: Any,
+    response: requests.Response | None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    print("=" * 100)
+    print(f"STEP: {name}")
+    print(f"REQUEST: {method.upper()} {url}")
+    print("REQUEST HEADERS:")
+    for key, value in (req_headers or {}).items():
+        print(f"  {key}: {value}")
+    if req_body is None:
+        print("REQUEST BODY: <none>")
+    else:
+        if isinstance(req_body, (dict, list)):
+            print("REQUEST BODY:")
+            print(json.dumps(req_body, indent=2, ensure_ascii=False))
+        else:
+            print(f"REQUEST BODY: {req_body}")
+
+    if dry_run:
+        print("DRY-RUN: request not sent")
+        return
+
+    if response is None:
+        print("RESPONSE: <none>")
+        return
+
+    print(f"RESPONSE STATUS: {response.status_code} {response.reason}")
+    print("RESPONSE HEADERS:")
+    for key, value in response.headers.items():
+        print(f"  {key}: {value}")
+    print("RESPONSE BODY:")
+    print(json_or_text(response))
+
+
+def do_request(
+    session: requests.Session,
+    *,
+    name: str,
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    json_body: Any = None,
+    timeout: float = 30.0,
+    dry_run: bool = False,
+) -> requests.Response | None:
+    print_exchange(
+        name=name,
+        method=method,
+        url=url,
+        req_headers=headers,
+        req_body=json_body,
+        response=None,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        return None
+
+    response = session.request(
+        method=method,
+        url=url,
+        headers=headers,
+        json=json_body,
+        timeout=timeout,
+    )
+    # Re-print with response details.
+    print_exchange(
+        name=name,
+        method=method,
+        url=url,
+        req_headers=headers,
+        req_body=json_body,
+        response=response,
+    )
+    return response
+
+
+def default_headers(*, uid: str | None = None, include_auth: str | None = None) -> dict[str, str]:
+    headers = {
+        "accept": ACCEPT,
+        "x-pm-appversion": APP_VERSION,
+        "x-pm-locale": LOCALE,
+        "content-type": "application/json",
+        "origin": ACCOUNT_BASE,
+        "referer": f"{ACCOUNT_BASE}/",
+    }
+    if uid:
+        headers["x-pm-uid"] = uid
+    if include_auth:
+        headers["authorization"] = f"Bearer {include_auth}"
+    return headers
+
+
+def extract_signed_modulus_b64(signed_modulus: str) -> str:
+    marker_start = "-----BEGIN PGP SIGNED MESSAGE-----"
+    marker_sig = "-----BEGIN PGP SIGNATURE-----"
+    if marker_start not in signed_modulus or marker_sig not in signed_modulus:
+        raise ValueError("Invalid signed modulus format")
+    body = signed_modulus.split("\n\n", 1)[1]
+    base64_part = body.split(marker_sig, 1)[0].strip()
+    if not base64_part:
+        raise ValueError("No modulus payload found in signed modulus")
+    return base64_part
+
+
+def concat_bytes(parts: list[bytes]) -> bytes:
+    return b"".join(parts)
+
+
+def sha512_expand(seed: bytes) -> bytes:
+    # Same as Proton web: concat SHA512(seed + counter) for counter 0..3.
+    blocks = []
+    for counter in range(4):
+        blocks.append(hashlib.sha512(seed + bytes([counter])).digest())
+    return b"".join(blocks)
+
+
+def normalize_username(value: str) -> str:
+    return value.replace(".", "").replace("-", "").replace("_", "").lower()
+
+
+def bcrypt_base64_encode(data: bytes, length: int) -> str:
+    if length <= 0:
+        raise ValueError("Illegal length for bcrypt base64 encoding")
+    if length > len(data):
+        raise ValueError("Requested length exceeds input size")
+
+    output = []
+    offset = 0
+    while offset < length:
+        c1 = data[offset]
+        offset += 1
+        output.append(BCRYPT_ALPHABET[(c1 >> 2) & 0x3F])
+        c1 = (c1 & 0x03) << 4
+        if offset >= length:
+            output.append(BCRYPT_ALPHABET[c1 & 0x3F])
+            break
+
+        c2 = data[offset]
+        offset += 1
+        c1 |= (c2 >> 4) & 0x0F
+        output.append(BCRYPT_ALPHABET[c1 & 0x3F])
+        c1 = (c2 & 0x0F) << 2
+        if offset >= length:
+            output.append(BCRYPT_ALPHABET[c1 & 0x3F])
+            break
+
+        c2 = data[offset]
+        offset += 1
+        c1 |= (c2 >> 6) & 0x03
+        output.append(BCRYPT_ALPHABET[c1 & 0x3F])
+        output.append(BCRYPT_ALPHABET[c2 & 0x3F])
+    return bytes(output).decode("ascii")
+
+
+def to_bigint_be(raw: bytes) -> int:
+    if not raw:
+        return 0
+    return int.from_bytes(raw, byteorder="big", signed=False)
+
+
+def to_bigint_le(raw: bytes) -> int:
+    return to_bigint_be(raw[::-1])
+
+
+def to_bytes(value: int, *, order: str = "be", size: int | None = None) -> bytes:
+    if value < 0:
+        raise ValueError("Negative values are not supported")
+    length = max(1, (value.bit_length() + 7) // 8)
+    out = value.to_bytes(length, byteorder="big", signed=False)
+    if size is not None:
+        out = out.rjust(size, b"\x00")
+    if order == "le":
+        out = out[::-1]
+    elif order != "be":
+        raise ValueError("order must be 'be' or 'le'")
+    return out
+
+
+def mod(value: int, modulus: int) -> int:
+    result = value % modulus
+    if result < 0:
+        result += modulus
+    return result
+
+
+def srp_password_hash(
+    *,
+    version: int,
+    password: str,
+    salt_b64: str | None,
+    username: str | None,
+    modulus_bytes: bytes,
+) -> bytes:
+    def t_hash(password_value: str, bcrypt_salt_suffix: str) -> bytes:
+        salt = BCRYPT_PREFIX + bcrypt_salt_suffix.encode("ascii")
+        hashed = bcrypt.hashpw(password_value.encode("utf-8"), salt)
+        return sha512_expand(hashed + modulus_bytes)
+
+    if version in (3, 4):
+        if not salt_b64:
+            raise ValueError("Missing SRP salt for auth version >=3")
+        salt_bytes = base64.b64decode(salt_b64)
+        seed = salt_bytes + b"proton"
+        if len(seed) != 16:
+            raise ValueError("Invalid salt seed length for Proton bcrypt derivation")
+        salt_suffix = bcrypt_base64_encode(seed, 16)
+        return t_hash(password, salt_suffix)
+
+    if version == 2:
+        if not username:
+            raise ValueError("Missing username for auth version 2")
+        md5_source = normalize_username(username).lower().encode("utf-8")
+        suffix = hashlib.md5(md5_source).hexdigest()
+        return t_hash(password, suffix)
+
+    if version == 1:
+        if not username:
+            raise ValueError("Missing username for auth version 1")
+        suffix = hashlib.md5(username.lower().encode("utf-8")).hexdigest()
+        return t_hash(password, suffix)
+
+    if version == 0:
+        if not username:
+            raise ValueError("Missing username for auth version 0")
+        mix = (username.lower() + password).encode("utf-8")
+        legacy = base64.b64encode(hashlib.sha512(mix).digest()).decode("ascii")
+        suffix = hashlib.md5(username.lower().encode("utf-8")).hexdigest()
+        return t_hash(legacy, suffix)
+
+    raise ValueError(f"Unsupported auth version: {version}")
+
+
+def generate_safe_client_values(byte_length: int, modulus: int, server_ephemeral: bytes) -> tuple[int, int, int]:
+    generator = 2
+    for _ in range(1000):
+        client_secret = to_bigint_le(secrets.token_bytes(byte_length))
+        client_ephemeral = pow(generator, client_secret, modulus)
+        client_ephemeral_le = to_bytes(client_ephemeral, order="le", size=byte_length)
+        scrambling_param = to_bigint_le(sha512_expand(client_ephemeral_le + server_ephemeral))
+        if scrambling_param != 0 and client_ephemeral != 0:
+            return client_secret, client_ephemeral, scrambling_param
+    raise RuntimeError("Could not generate safe SRP client parameters")
+
+
+def compute_srp_proofs(auth_info: dict[str, Any], *, username: str, password: str) -> tuple[str, str, str]:
+    version = int(auth_info["Version"])
+    signed_modulus = auth_info["Modulus"]
+    server_ephemeral_b64 = auth_info["ServerEphemeral"]
+    srp_session = auth_info["SRPSession"]
+
+    signed_username = auth_info.get("Username")
+    if version <= 2 and signed_username and username.lower() != signed_username.lower():
+        raise ValueError("Username mismatch with server-provided auth info")
+
+    modulus_payload_b64 = extract_signed_modulus_b64(signed_modulus)
+    modulus_bytes = base64.b64decode(modulus_payload_b64)
+    server_ephemeral = base64.b64decode(server_ephemeral_b64)
+    hashed_password = srp_password_hash(
+        version=version,
+        password=password,
+        salt_b64=auth_info.get("Salt"),
+        username=signed_username if version < 3 else None,
+        modulus_bytes=modulus_bytes,
+    )
+
+    byte_length = 256
+    modulus = to_bigint_le(modulus_bytes)
+    if len(to_bytes(modulus, order="be")) != byte_length:
+        raise ValueError("SRP modulus has incorrect size")
+
+    generator = 2
+    multiplier_hash = sha512_expand(to_bytes(generator, order="le", size=byte_length) + modulus_bytes)
+    multiplier = to_bigint_le(multiplier_hash)
+    server_ephemeral_int = to_bigint_le(server_ephemeral)
+    password_int = to_bigint_le(hashed_password)
+    modulus_minus_one = modulus - 1
+    k_mod = mod(multiplier, modulus)
+    if server_ephemeral_int == 0:
+        raise ValueError("SRP server ephemeral is out of bounds")
+
+    client_secret, client_ephemeral, scrambling = generate_safe_client_values(
+        byte_length, modulus, server_ephemeral
+    )
+    gx = mod(pow(generator, password_int, modulus) * k_mod, modulus)
+    exponent = mod(scrambling * password_int + client_secret, modulus_minus_one)
+    base = mod(server_ephemeral_int - gx, modulus)
+    shared_session_int = pow(base, exponent, modulus)
+
+    client_ephemeral_bytes = to_bytes(client_ephemeral, order="le", size=byte_length)
+    shared_session_bytes = to_bytes(shared_session_int, order="le", size=byte_length)
+    client_proof = sha512_expand(client_ephemeral_bytes + server_ephemeral + shared_session_bytes)
+    expected_server_proof = sha512_expand(client_ephemeral_bytes + client_proof + shared_session_bytes)
+
+    return (
+        base64.b64encode(client_ephemeral_bytes).decode("ascii"),
+        base64.b64encode(client_proof).decode("ascii"),
+        base64.b64encode(expected_server_proof).decode("ascii"),
+    )
+
+
+def require_json(response: requests.Response, step: str) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{step}: response is not valid JSON") from exc
+    return data
+
+
+def run_flow(email: str, password: str, *, intent: str, timeout: float, skip_challenge: bool, dry_run: bool) -> int:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "accept": ACCEPT,
+            "x-pm-appversion": APP_VERSION,
+            "x-pm-locale": LOCALE,
+            "user-agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+        }
+    )
+
+    if not skip_challenge:
+        do_request(
+            session,
+            name="Challenge login page",
+            method="GET",
+            url=f"{CHALLENGE_BASE}/challenge/v4/html?Type=0&Name=login&Lang=en-US&Dir=ltr",
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+        do_request(
+            session,
+            name="Challenge unauth page",
+            method="GET",
+            url=f"{CHALLENGE_BASE}/challenge/v4/html?Type=0&Name=unauth&Lang=en-US&Dir=ltr",
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+        do_request(
+            session,
+            name="Access incoming preflight",
+            method="GET",
+            url=f"{ACCOUNT_BASE}/api/account/v1/access/incoming",
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+        do_request(
+            session,
+            name="Access outgoing preflight",
+            method="GET",
+            url=f"{ACCOUNT_BASE}/api/account/v1/access/outgoing",
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+
+    session_headers = {"x-enforce-unauthsession": "true"}
+    create_session_resp = do_request(
+        session,
+        name="Create unauth session",
+        method="POST",
+        url=f"{ACCOUNT_BASE}/api/auth/v4/sessions",
+        headers=session_headers,
+        timeout=timeout,
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        print("Dry-run complete: full flow steps printed.")
+        return 0
+
+    create_session_json = require_json(create_session_resp, "Create unauth session")
+    tokens = SessionTokens(
+        access_token=create_session_json["AccessToken"],
+        refresh_token=create_session_json["RefreshToken"],
+        uid=create_session_json["UID"],
+    )
+
+    info_headers = default_headers(uid=tokens.uid)
+    auth_info_resp = do_request(
+        session,
+        name="Get auth info",
+        method="POST",
+        url=f"{ACCOUNT_BASE}/api/core/v4/auth/info",
+        headers=info_headers,
+        json_body={"Username": email, "Intent": intent},
+        timeout=timeout,
+    )
+    auth_info = require_json(auth_info_resp, "Get auth info")
+
+    client_ephemeral_b64, client_proof_b64, expected_server_proof = compute_srp_proofs(
+        auth_info, username=email, password=password
+    )
+
+    auth_resp = do_request(
+        session,
+        name="Submit SRP auth",
+        method="POST",
+        url=f"{ACCOUNT_BASE}/api/core/v4/auth",
+        headers=info_headers,
+        json_body={
+            "ClientProof": client_proof_b64,
+            "ClientEphemeral": client_ephemeral_b64,
+            "SRPSession": auth_info["SRPSession"],
+            "Username": email,
+            "PersistentCookies": 1,
+        },
+        timeout=timeout,
+    )
+    auth_json = require_json(auth_resp, "Submit SRP auth")
+    server_proof = auth_json.get("ServerProof")
+    if server_proof and server_proof != expected_server_proof:
+        raise RuntimeError("Server proof mismatch: login response could not be verified.")
+
+    state_token = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(24))
+    cookie_headers = default_headers(uid=tokens.uid, include_auth=tokens.access_token)
+    do_request(
+        session,
+        name="Exchange refresh token for cookies",
+        method="POST",
+        url=f"{ACCOUNT_BASE}/api/core/v4/auth/cookies",
+        headers=cookie_headers,
+        json_body={
+            "UID": tokens.uid,
+            "ResponseType": "token",
+            "GrantType": "refresh_token",
+            "RefreshToken": tokens.refresh_token,
+            "RedirectURI": "https://protonmail.com",
+            "Persistent": 1,
+            "State": state_token,
+        },
+        timeout=timeout,
+    )
+
+    print("=" * 100)
+    print("Login flow completed.")
+    print(f"UID: {tokens.uid}")
+    print(f"SRP Session: {auth_info['SRPSession']}")
+    return 0
 
 
 def main() -> int:
     args = parse_args()
-
-    if not args.har.exists():
-        print(f"HAR file not found: {args.har}", file=sys.stderr)
+    try:
+        email, password = prompt_credentials(args)
+        return run_flow(
+            email,
+            password,
+            intent=args.intent,
+            timeout=args.timeout,
+            skip_challenge=args.skip_challenge,
+            dry_run=args.dry_run,
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    entries = load_har(args.har)
-    captured_email = args.captured_email or detect_first_email(entries)
-
-    email = args.email or input(f"Email [{captured_email or ''}]: ").strip() or (captured_email or "")
-    if not email:
-        print("Email is required.", file=sys.stderr)
-        return 1
-
-    password = args.password if args.password is not None else getpass.getpass("Password: ")
-    if not password:
-        print("Password is required.", file=sys.stderr)
-        return 1
-
-    filtered = filter_entries(entries, args.mode)
-    print(f"Loaded {len(entries)} HAR entries.")
-    print(f"Replaying {len(filtered)} entries in '{args.mode}' mode.")
-    if args.captured_password is None:
-        print("Note: no captured password replacement provided; Proton typically uses SRP proofs, not plaintext passwords.")
-    if not filtered:
-        print("No entries matched selected mode.", file=sys.stderr)
-        return 1
-
-    replay_entries(
-        filtered,
-        email=email,
-        password=password,
-        captured_email=captured_email,
-        captured_password=args.captured_password,
-        timeout=args.timeout,
-        dry_run=args.dry_run,
-    )
-    return 0
 
 
 if __name__ == "__main__":

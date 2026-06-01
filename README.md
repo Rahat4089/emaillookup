@@ -1,9 +1,9 @@
 # emaillookup
 
-## HAR login replay script
+## Proton full login reverse script
 
-`replay_login_from_har.py` replays login-related HTTP requests captured in a HAR
-file and prints each response.
+`replay_login_from_har.py` executes Proton's real SRP-based login flow and prints
+all request/response steps.
 
 ### Usage
 
@@ -13,17 +13,22 @@ python3 replay_login_from_har.py
 
 Optional flags:
 
-- `--har <path>`: HAR file path
-- `--mode login|all`: replay only login requests (default: `login`) or all
-  requests from the HAR
 - `--email <email>` and `--password <password>`: non-interactive credentials
-- `--dry-run`: print requests without sending them
+- `--intent Auto|Proton`: auth intent (default: `Proton`)
+- `--skip-challenge`: skip pre-login challenge/access calls
+- `--dry-run`: print all planned login steps without sending requests
 
 Example:
 
 ```bash
 python3 replay_login_from_har.py \
-  --har account-api.proton.me_2026_06_01_18_34_28.har \
-  --mode login \
+  --email "you@example.com" \
+  --password "your-password" \
   --dry-run
+```
+
+Dependency:
+
+```bash
+python3 -m pip install bcrypt
 ```

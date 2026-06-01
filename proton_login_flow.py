@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import bcrypt
+import certifi
 import requests
 
 
@@ -206,12 +207,14 @@ class ProtonWebLogin:
         locale: str = "en_US",
         timeout: int = 30,
         print_responses: bool = False,
+        verify_tls: bool | str = certifi.where(),
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.app_version = app_version
         self.referer = referer
         self.timeout = timeout
         self.print_responses = print_responses
+        self.verify_tls = verify_tls
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -255,13 +258,25 @@ class ProtonWebLogin:
         json_body: dict[str, Any] | None = None,
         bearer: bool = False,
     ) -> dict[str, Any]:
-        response = self.session.request(
-            method,
-            f"{self.base_url}{path}",
-            json=json_body,
-            headers=self._headers(bearer=bearer),
-            timeout=self.timeout,
-        )
+        try:
+            response = self.session.request(
+                method,
+                f"{self.base_url}{path}",
+                json=json_body,
+                headers=self._headers(bearer=bearer),
+                timeout=self.timeout,
+                verify=self.verify_tls,
+            )
+        except requests.exceptions.SSLError as exc:
+            raise ProtonLoginError(
+                "TLS certificate verification failed before an API response was "
+                "received.\n"
+                f"Using CA bundle: {self.verify_tls}\n"
+                "Try: python -m pip install --upgrade certifi requests\n"
+                "If you are behind a proxy/antivirus that intercepts HTTPS, export "
+                "that root CA as a PEM file and run with --ca-bundle path\\to\\ca.pem.\n"
+                "For local debugging only, you can run with --insecure-skip-verify."
+            ) from exc
 
         self._print_raw_response(method, path, response)
 
@@ -484,6 +499,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--username", help="Proton username/email; prefer PROTON_USERNAME")
     parser.add_argument("--password", help="Proton password; prefer PROTON_PASSWORD or prompt")
     parser.add_argument("--totp", help="Optional TOTP code; prefer PROTON_TOTP")
+    parser.add_argument(
+        "--ca-bundle",
+        default=os.getenv("PROTON_CA_BUNDLE"),
+        help="Path to a PEM CA bundle for TLS verification; defaults to certifi",
+    )
+    parser.add_argument(
+        "--insecure-skip-verify",
+        action="store_true",
+        help="Disable TLS certificate verification for local debugging only",
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--app-version", default=DEFAULT_APP_VERSION)
     args = parser.parse_args(argv)
@@ -504,10 +529,21 @@ def main(argv: list[str] | None = None) -> int:
     print_responses = not args.no_print_responses
     if print_responses:
         print("Raw API responses will be printed below. They may contain session tokens; keep this output private.")
+
+    if args.insecure_skip_verify:
+        verify_tls: bool | str = False
+        print(
+            "WARNING: TLS certificate verification is disabled. Use only for local debugging.",
+            file=sys.stderr,
+        )
+    else:
+        verify_tls = args.ca_bundle or certifi.where()
+
     client = ProtonWebLogin(
         base_url=args.base_url,
         app_version=args.app_version,
         print_responses=print_responses,
+        verify_tls=verify_tls,
     )
     auth_payload = client.authenticate(username, password, totp=totp)
 

@@ -81,6 +81,28 @@ PROTON_USERNAME="user@example.com" PROTON_PASSWORD="..." \
   python3 proton_login_flow.py --live-login --fetch-user
 ```
 
+
+### TLS certificate errors on Windows
+
+If you see `CERTIFICATE_VERIFY_FAILED`, first update the certificate bundle:
+
+```bash
+python -m pip install --upgrade certifi requests
+```
+
+If your network, proxy, or antivirus intercepts HTTPS, export its root
+certificate as a PEM file and run:
+
+```bash
+python3 proton_login_flow.py --ca-bundle path/to/root-ca.pem
+```
+
+For local debugging only, you can bypass certificate verification:
+
+```bash
+python3 proton_login_flow.py --insecure-skip-verify
+```
+
 The script does not hardcode passwords. By default, live login prints raw
 responses because this is useful for learning/debugging; use
 `--no-print-responses` if you do not want tokens or account data printed.

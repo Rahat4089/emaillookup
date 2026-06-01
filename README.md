@@ -5,6 +5,10 @@
 `replay_login_from_har.py` executes Proton's real SRP-based login flow and prints
 all request/response steps.
 
+Note:
+- `access/incoming` and `access/outgoing` preflight calls can return `401` before
+  auth; this is expected and does not block login.
+
 ### Usage
 
 ```bash

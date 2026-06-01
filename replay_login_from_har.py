@@ -529,29 +529,40 @@ def run_flow(
     if server_proof and server_proof != expected_server_proof:
         raise RuntimeError("Server proof mismatch: login response could not be verified.")
 
+    authenticated_tokens = SessionTokens(
+        access_token=auth_json.get("AccessToken", tokens.access_token),
+        refresh_token=auth_json.get("RefreshToken", tokens.refresh_token),
+        uid=auth_json.get("UID", tokens.uid),
+    )
+
     state_token = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(24))
-    cookie_headers = default_headers(uid=tokens.uid, include_auth=tokens.access_token)
-    do_request(
+    cookie_headers = default_headers(
+        uid=authenticated_tokens.uid,
+        include_auth=authenticated_tokens.access_token,
+    )
+    cookie_resp = do_request(
         session,
         name="Exchange refresh token for cookies",
         method="POST",
         url=f"{ACCOUNT_BASE}/api/core/v4/auth/cookies",
         headers=cookie_headers,
         json_body={
-            "UID": tokens.uid,
+            "UID": authenticated_tokens.uid,
             "ResponseType": "token",
             "GrantType": "refresh_token",
-            "RefreshToken": tokens.refresh_token,
+            "RefreshToken": authenticated_tokens.refresh_token,
             "RedirectURI": "https://protonmail.com",
             "Persistent": 1,
             "State": state_token,
         },
         timeout=timeout,
     )
+    cookie_json = require_json(cookie_resp, "Exchange refresh token for cookies")
+    require_success_code(cookie_json, "Exchange refresh token for cookies")
 
     print("=" * 100)
     print("Login flow completed.")
-    print(f"UID: {tokens.uid}")
+    print(f"UID: {authenticated_tokens.uid}")
     print(f"SRP Session: {auth_info['SRPSession']}")
     return 0
 

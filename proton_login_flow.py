@@ -9,8 +9,9 @@ Usage examples:
 
     python3 proton_login_flow.py --har account-api.proton.me_2026_06_01_18_34_28.har
 
-    PROTON_USERNAME="user@example.com" PROTON_PASSWORD="..." \
-        python3 proton_login_flow.py --live-login --fetch-user
+    python3 proton_login_flow.py
+
+    PROTON_USERNAME="user@example.com" PROTON_PASSWORD="..." python3 proton_login_flow.py --live-login --fetch-user
 
 Dependencies:
 
@@ -204,11 +205,13 @@ class ProtonWebLogin:
         referer: str = DEFAULT_REFERER,
         locale: str = "en_US",
         timeout: int = 30,
+        print_responses: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.app_version = app_version
         self.referer = referer
         self.timeout = timeout
+        self.print_responses = print_responses
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -234,6 +237,12 @@ class ProtonWebLogin:
             headers["authorization"] = f"Bearer {self.access_token}"
         return headers
 
+    def _print_api_response(self, method: str, path: str, status_code: int, payload: Any) -> None:
+        if not self.print_responses:
+            return
+        print(f"\n=== {method} {path} -> HTTP {status_code} ===")
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
     def _api(
         self,
         method: str,
@@ -256,6 +265,8 @@ class ProtonWebLogin:
             raise ProtonLoginError(
                 f"{method} {path} returned non-JSON status {response.status_code}"
             ) from exc
+
+        self._print_api_response(method, path, response.status_code, payload)
 
         if response.status_code >= 400 or payload.get("Code") not in (None, 1000):
             message = payload.get("Error") or payload.get("ErrorDescription") or payload
@@ -454,16 +465,28 @@ def get_credentials(args: argparse.Namespace) -> tuple[str, str, str | None]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--har", help="Path to a HAR file to summarize safely")
     parser.add_argument("--live-login", action="store_true", help="Run the live Proton login flow")
     parser.add_argument("--fetch-user", action="store_true", help="Fetch /api/core/v4/users after login")
+    parser.add_argument(
+        "--no-print-responses",
+        action="store_true",
+        help="Do not print API JSON responses during live login",
+    )
     parser.add_argument("--username", help="Proton username/email; prefer PROTON_USERNAME")
     parser.add_argument("--password", help="Proton password; prefer PROTON_PASSWORD or prompt")
     parser.add_argument("--totp", help="Optional TOTP code; prefer PROTON_TOTP")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--app-version", default=DEFAULT_APP_VERSION)
     args = parser.parse_args(argv)
+    default_interactive_login = not args.har and not args.live_login
+    if default_interactive_login:
+        args.live_login = True
+        args.fetch_user = True
 
     if args.har:
         analyze_har(args.har)
@@ -474,7 +497,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     username, password, totp = get_credentials(args)
-    client = ProtonWebLogin(base_url=args.base_url, app_version=args.app_version)
+    print_responses = not args.no_print_responses
+    if print_responses:
+        print("API responses will be printed below. They may contain session tokens; keep this output private.")
+    client = ProtonWebLogin(
+        base_url=args.base_url,
+        app_version=args.app_version,
+        print_responses=print_responses,
+    )
     auth_payload = client.authenticate(username, password, totp=totp)
 
     print("SRP login succeeded.")

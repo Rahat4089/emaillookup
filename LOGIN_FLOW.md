@@ -62,17 +62,25 @@ verify the password without receiving it.
 ## Script
 
 `proton_login_flow.py` implements the SRP portion and the web cookie exchange.
-It intentionally reads credentials from environment variables or prompts:
+Run it with no arguments to prompt for email/password, perform the login, print
+each API JSON response, and fetch the user profile. Printed responses can include
+session tokens and key material, so keep the output private.
 
 ```bash
 python3 -m pip install -r requirements.txt
 
+# Interactive: asks for email/password, logs in, and prints API responses.
+python3 proton_login_flow.py
+
+# Analyze the HAR without logging in.
 python3 proton_login_flow.py \
   --har account-api.proton.me_2026_06_01_18_34_28.har
 
+# Non-interactive login; use --no-print-responses to suppress full response dumps.
 PROTON_USERNAME="user@example.com" PROTON_PASSWORD="..." \
   python3 proton_login_flow.py --live-login --fetch-user
 ```
 
-The script does not hardcode or print access tokens, refresh tokens, cookies, or
-passwords.
+The script does not hardcode passwords. By default, live login prints full JSON
+responses because this is useful for learning/debugging; use
+`--no-print-responses` if you do not want tokens or account data printed.

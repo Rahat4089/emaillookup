@@ -237,11 +237,15 @@ class ProtonWebLogin:
             headers["authorization"] = f"Bearer {self.access_token}"
         return headers
 
-    def _print_api_response(self, method: str, path: str, status_code: int, payload: Any) -> None:
+    def _print_raw_response(self, method: str, path: str, response: requests.Response) -> None:
         if not self.print_responses:
             return
-        print(f"\n=== {method} {path} -> HTTP {status_code} ===")
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(f"\n=== {method} {path} -> HTTP {response.status_code} ===")
+        print("--- response headers ---")
+        for name, value in response.headers.items():
+            print(f"{name}: {value}")
+        print("--- raw response body ---")
+        print(response.text)
 
     def _api(
         self,
@@ -259,14 +263,14 @@ class ProtonWebLogin:
             timeout=self.timeout,
         )
 
+        self._print_raw_response(method, path, response)
+
         try:
             payload = response.json()
         except ValueError as exc:
             raise ProtonLoginError(
                 f"{method} {path} returned non-JSON status {response.status_code}"
             ) from exc
-
-        self._print_api_response(method, path, response.status_code, payload)
 
         if response.status_code >= 400 or payload.get("Code") not in (None, 1000):
             message = payload.get("Error") or payload.get("ErrorDescription") or payload
@@ -475,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-print-responses",
         action="store_true",
-        help="Do not print API JSON responses during live login",
+        help="Do not print raw API responses during live login",
     )
     parser.add_argument("--username", help="Proton username/email; prefer PROTON_USERNAME")
     parser.add_argument("--password", help="Proton password; prefer PROTON_PASSWORD or prompt")
@@ -499,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
     username, password, totp = get_credentials(args)
     print_responses = not args.no_print_responses
     if print_responses:
-        print("API responses will be printed below. They may contain session tokens; keep this output private.")
+        print("Raw API responses will be printed below. They may contain session tokens; keep this output private.")
     client = ProtonWebLogin(
         base_url=args.base_url,
         app_version=args.app_version,

@@ -4,51 +4,15 @@
 /**
  * Build FashionGo login payload using only Node built-in libraries.
  *
- * Required inputs:
+ * Edit these variables directly:
  * - username (email)
  * - password (plaintext)
  * - keyId
  * - modulus (hex string)
  * - exponent (hex string)
- *
- * Usage:
- *   node build_login_payload.js \
- *     --username "user@example.com" \
- *     --password "plaintext-password" \
- *     --keyId "d32ec93f0cb943d2a757e2cb30ff3b28" \
- *     --modulus "<hex modulus>" \
- *     --exponent "10001"
  */
 
 const crypto = require("crypto");
-
-function parseArgs(argv) {
-  const parsed = {};
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (!token.startsWith("--")) {
-      continue;
-    }
-
-    const eqIndex = token.indexOf("=");
-    if (eqIndex !== -1) {
-      const key = token.slice(2, eqIndex);
-      const value = token.slice(eqIndex + 1);
-      parsed[key] = value;
-      continue;
-    }
-
-    const key = token.slice(2);
-    const next = argv[i + 1];
-    if (!next || next.startsWith("--")) {
-      parsed[key] = "true";
-    } else {
-      parsed[key] = next;
-      i += 1;
-    }
-  }
-  return parsed;
-}
 
 function toBase64UrlFromHex(hexString) {
   const normalized = hexString.length % 2 === 0 ? hexString : `0${hexString}`;
@@ -81,14 +45,14 @@ function rsaEncryptPassphrase(passphrase, modulusHex, exponentHex) {
     n: toBase64UrlFromHex(modulusHex),
     e: toBase64UrlFromHex(exponentHex),
   };
+
   const publicKey = crypto.createPublicKey({ key: jwk, format: "jwk" });
   const encryptedBytes = crypto.publicEncrypt(
     { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
     Buffer.from(passphrase, "utf8")
   );
 
-  // Browser JS produces an RSA hex string before base64-encoding that string.
-  // Matching that flow:
+  // Browser JS returns RSA ciphertext as hex text, then base64 of that hex string.
   let encryptedHex = encryptedBytes.toString("hex").replace(/^0+/, "");
   if (encryptedHex.length === 0) {
     encryptedHex = "0";
@@ -96,11 +60,13 @@ function rsaEncryptPassphrase(passphrase, modulusHex, exponentHex) {
   if (encryptedHex.length % 2 !== 0) {
     encryptedHex = `0${encryptedHex}`;
   }
+
   return Buffer.from(encryptedHex, "ascii").toString("base64");
 }
 
 function buildLoginPayload({ username, password, keyId, modulus, exponent }) {
   const passphrase = generateHexString(32);
+
   return {
     userName: username,
     password: aesEncryptPassword(password, passphrase),
@@ -109,37 +75,47 @@ function buildLoginPayload({ username, password, keyId, modulus, exponent }) {
   };
 }
 
-function assertRequiredInputs(input) {
-  const required = ["username", "password", "keyId", "modulus", "exponent"];
-  const missing = required.filter((key) => !input[key] || !String(input[key]).trim());
+function assertRequiredInputs({ username, password, keyId, modulus, exponent }) {
+  const missing = [];
+  if (!username || !String(username).trim()) missing.push("username");
+  if (!password || !String(password).trim()) missing.push("password");
+  if (!keyId || !String(keyId).trim()) missing.push("keyId");
+  if (!modulus || !String(modulus).trim()) missing.push("modulus");
+  if (!exponent || !String(exponent).trim()) missing.push("exponent");
+
   if (missing.length > 0) {
-    throw new Error(
-      `Missing required inputs: ${missing.join(", ")}\n` +
-        "Required: username, password, keyId, modulus, exponent"
-    );
+    throw new Error(`Missing required inputs: ${missing.join(", ")}`);
+  }
+
+  if (!/^[0-9a-fA-F]+$/.test(modulus)) {
+    throw new Error("modulus must be a valid hex string");
+  }
+  if (!/^[0-9a-fA-F]+$/.test(exponent)) {
+    throw new Error("exponent must be a valid hex string");
   }
 }
 
-function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const input = {
-    username: args.username,
-    password: args.password,
-    keyId: args.keyId,
-    modulus: args.modulus,
-    exponent: args.exponent,
-  };
-
-  assertRequiredInputs(input);
-
-  const payload = buildLoginPayload(input);
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-}
+// ====== Set your inputs here ======
+const username = "user@example.com";
+const password = "plaintext-password";
+const keyId = "d32ec93f0cb943d2a757e2cb30ff3b28";
+const modulus = "PUT_MODULUS_HEX_HERE";
+const exponent = "10001";
+// ==================================
 
 try {
-  main();
+  assertRequiredInputs({ username, password, keyId, modulus, exponent });
+
+  const payload = buildLoginPayload({
+    username,
+    password,
+    keyId,
+    modulus,
+    exponent,
+  });
+
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
 } catch (error) {
   process.stderr.write(`Error: ${error.message}\n`);
   process.exit(1);
 }
-

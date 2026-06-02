@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import gzip
 import hashlib
 import hmac
 import json
@@ -38,6 +39,7 @@ USER_AGENT = f"Ding/{CLIENT_VERSION}"
 DEFAULT_DEVICE_ID_PATH = Path.home() / ".ding_deviceid"
 SENSITIVE_KEYS = {
     "bearerToken",
+    "email",
     "originalBearerToken",
     "refreshToken",
     "token",
@@ -269,14 +271,26 @@ class DingClient:
 
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                response_body = response.read().decode("utf-8")
+                response_body = decode_response_body(
+                    response.read(), response.headers.get("content-encoding", "")
+                )
         except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
+            error_body = decode_response_body(
+                exc.read(), exc.headers.get("content-encoding", "")
+            )
             raise DingApiError(exc.code, error_body) from exc
 
         if not response_body:
             return {}
         return json.loads(response_body)
+
+
+def decode_response_body(raw: bytes, content_encoding: str) -> str:
+    """Decode API response bytes, including gzip bodies returned by OkHttp APIs."""
+
+    if content_encoding.lower() == "gzip":
+        raw = gzip.decompress(raw)
+    return raw.decode("utf-8", errors="replace")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

@@ -5,14 +5,21 @@
 1. App bootstrap (`index.tsx`) calls SDK init with:
    - `baseUrl: /api/v1`
    - `countryCode: BN`
-2. API client builds auth headers and sends JSON requests.
-3. Fingerprint is initialized (`FingerprintJS`) and placed into `x-fingerprint` header.
+2. SDK resolves brand settings from:
+   - `GET /casino/brand-info`
+3. API client builds auth headers and sends JSON requests.
+4. Fingerprint is initialized (`FingerprintJS`) and placed into `x-fingerprint` header.
 
 ## Login endpoint
 
 - Method: `POST`
 - URL: `https://elon.casino/api/v1/auth/sign-in/client`
-- Payload shape (email login):
+
+### Payload variants accepted by validator
+
+`type` must be one of: `email | phone | quick | token | oauth`
+
+Email login payload:
 
 ```json
 {
@@ -22,12 +29,35 @@
 }
 ```
 
+Quick login payload:
+
+```json
+{
+  "type": "quick",
+  "username": "<username>",
+  "password": "<password>"
+}
+```
+
+Phone login payload:
+
+```json
+{
+  "type": "phone",
+  "phone": "+<country-code><number>",
+  "password": "<password>"
+}
+```
+
 ## Headers used by JS flow
 
 - `Content-Type: application/json`
-- `x-brand-prefix: <brand-prefix>`
+- `Accept: application/json, text/plain, */*`
+- `Origin: https://elon.casino`
+- `Referer: https://elon.casino/casino/`
+- `x-brand-prefix: <brand-prefix>` (fetched from `/casino/brand-info`)
 - `x-forwarded-host: https://elon.casino`
-- `x-country-code: BN`
+- `x-country-code: BN` (from app init)
 - `x-fingerprint: <fingerprint id>`
 - `Authorization: Bearer <access-token>` (empty on first sign-in)
 - `refresh_token: <refresh-token>` (empty on first sign-in)
@@ -45,12 +75,19 @@
 }
 ```
 
-## Live test with provided credentials
+## Live tests with provided credential
 
 Credential tested:
 - `madigitalstudio2018@gmail.com:01770921730`
 
-Result from endpoint (raw API):
-- `HTTP 401`
-- Body: `{"message":"bad request","error":"Unauthorized","statusCode":401}`
+Observed responses:
+- `type=email` -> `HTTP 401 Unauthorized`
+- `type=quick` (username=email and username=madigitalstudio2018) -> `HTTP 401 Unauthorized`
+- `type=phone` (`+8801770921730`) -> `HTTP 401 Unauthorized`
+
+Raw body for unauthorized responses:
+
+```json
+{"message":"bad request","error":"Unauthorized","statusCode":401}
+```
 

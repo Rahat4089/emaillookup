@@ -1,4 +1,272 @@
 /*! For license information please see main.101751d4.js.LICENSE.txt */
+if ("undefined" !== typeof process && process.versions && process.versions.node && process.argv.includes("--login-test")) {
+    const DEFAULT_ORIGIN = "https://cawabanga.com";
+    const DEFAULT_API_PATH = "/api/v1";
+    const DEFAULT_COUNTRY_CODE = "BN";
+    const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+    const MASKED_KEYS = /(^|_|-)(access|refresh|id)?token($|_|-)|password|secret|authorization/i;
+    const UINT64_MASK = (1n << 64n) - 1n;
+
+    function parseLoginArgs(argv) {
+        const args = {
+            origin: process.env.LOGIN_ORIGIN || DEFAULT_ORIGIN,
+            apiPath: process.env.LOGIN_API_PATH || DEFAULT_API_PATH,
+            countryCode: process.env.LOGIN_COUNTRY_CODE || DEFAULT_COUNTRY_CODE,
+            login: process.env.LOGIN_EMAIL || process.env.LOGIN_USER || "",
+            password: process.env.LOGIN_PASSWORD || "",
+            fingerprint: process.env.LOGIN_FINGERPRINT || "",
+            userAgent: process.env.LOGIN_USER_AGENT || DEFAULT_USER_AGENT
+        };
+        for (let i = 0; i < argv.length; i += 1) {
+            const item = argv[i];
+            if (!item.startsWith("--") || item === "--login-test")
+                continue;
+            const key = item.slice(2);
+            const value = argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[++i] : "true";
+            if ("origin" === key)
+                args.origin = value;
+            else if ("api-path" === key || "base-url" === key)
+                args.apiPath = value;
+            else if ("country-code" === key || "country" === key)
+                args.countryCode = value;
+            else if ("login" === key || "email" === key)
+                args.login = value;
+            else if ("password" === key)
+                args.password = value;
+            else if ("fingerprint" === key)
+                args.fingerprint = value;
+            else if ("user-agent" === key)
+                args.userAgent = value;
+        }
+        return args;
+    }
+
+    function normalizeOrigin(origin) {
+        const parsed = new URL(origin || DEFAULT_ORIGIN);
+        return parsed.origin;
+    }
+
+    function resolveApiBase(origin, apiPath) {
+        if (/^https?:\/\//i.test(apiPath))
+            return apiPath.replace(/\/+$/, "");
+        return `${origin}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`.replace(/\/+$/, "");
+    }
+
+    function readUInt64LE(bytes, offset, length) {
+        let value = 0n;
+        for (let i = 0; i < length; i += 1)
+            value |= BigInt(bytes[offset + i] || 0) << BigInt(8 * i);
+        return value & UINT64_MASK;
+    }
+
+    function rotateLeft64(value, bits) {
+        const shift = BigInt(bits);
+        return ((value << shift) | (value >> (64n - shift))) & UINT64_MASK;
+    }
+
+    function fmix64(value) {
+        value ^= value >> 33n;
+        value = value * 0xff51afd7ed558ccdn & UINT64_MASK;
+        value ^= value >> 33n;
+        value = value * 0xc4ceb9fe1a85ec53n & UINT64_MASK;
+        value ^= value >> 33n;
+        return value & UINT64_MASK;
+    }
+
+    function hex64(value) {
+        return (value & UINT64_MASK).toString(16).padStart(16, "0");
+    }
+
+    function x64hash128(input, seed) {
+        const bytes = new TextEncoder().encode(input);
+        let h1 = BigInt(seed || 0) & UINT64_MASK;
+        let h2 = h1;
+        const c1 = 0x87c37b91114253d5n;
+        const c2 = 0x4cf5ad432745937fn;
+        const blockCount = Math.floor(bytes.length / 16);
+
+        for (let block = 0; block < blockCount; block += 1) {
+            const offset = 16 * block;
+            let k1 = readUInt64LE(bytes, offset, 8);
+            let k2 = readUInt64LE(bytes, offset + 8, 8);
+            k1 = k1 * c1 & UINT64_MASK;
+            k1 = rotateLeft64(k1, 31);
+            k1 = k1 * c2 & UINT64_MASK;
+            h1 ^= k1;
+            h1 = rotateLeft64(h1, 27);
+            h1 = (h1 + h2) & UINT64_MASK;
+            h1 = (h1 * 5n + 0x52dce729n) & UINT64_MASK;
+            k2 = k2 * c2 & UINT64_MASK;
+            k2 = rotateLeft64(k2, 33);
+            k2 = k2 * c1 & UINT64_MASK;
+            h2 ^= k2;
+            h2 = rotateLeft64(h2, 31);
+            h2 = (h2 + h1) & UINT64_MASK;
+            h2 = (h2 * 5n + 0x38495ab5n) & UINT64_MASK;
+        }
+
+        let k1 = 0n;
+        let k2 = 0n;
+        const tailOffset = 16 * blockCount;
+        const tailLength = bytes.length & 15;
+        if (tailLength > 8)
+            k2 = readUInt64LE(bytes, tailOffset + 8, tailLength - 8);
+        if (tailLength > 0)
+            k1 = readUInt64LE(bytes, tailOffset, Math.min(tailLength, 8));
+        if (k2) {
+            k2 = k2 * c2 & UINT64_MASK;
+            k2 = rotateLeft64(k2, 33);
+            k2 = k2 * c1 & UINT64_MASK;
+            h2 ^= k2;
+        }
+        if (k1) {
+            k1 = k1 * c1 & UINT64_MASK;
+            k1 = rotateLeft64(k1, 31);
+            k1 = k1 * c2 & UINT64_MASK;
+            h1 ^= k1;
+        }
+
+        h1 ^= BigInt(bytes.length);
+        h2 ^= BigInt(bytes.length);
+        h1 = (h1 + h2) & UINT64_MASK;
+        h2 = (h2 + h1) & UINT64_MASK;
+        h1 = fmix64(h1);
+        h2 = fmix64(h2);
+        h1 = (h1 + h2) & UINT64_MASK;
+        h2 = (h2 + h1) & UINT64_MASK;
+        return `${hex64(h1)}${hex64(h2)}`;
+    }
+
+    function hashComponents(components) {
+        let payload = "";
+        for (const key of Object.keys(components).sort()) {
+            const component = components[key];
+            const value = component && Object.prototype.hasOwnProperty.call(component, "error") ? "error" : JSON.stringify(component.value);
+            payload += `${payload ? "|" : ""}${key.replace(/([:|\\])/g, "\\$1")}:${value}`;
+        }
+        return x64hash128(payload);
+    }
+
+    function generateFingerprint(options) {
+        const components = {
+            architecture: { value: 255 },
+            colorDepth: { value: 24 },
+            colorGamut: { value: "srgb" },
+            cookiesEnabled: { value: true },
+            hardwareConcurrency: { value: 8 },
+            languages: { value: [["en-US", "en"]] },
+            platform: { value: "Win32" },
+            screenFrame: { value: [0, 0, 0, 0] },
+            screenResolution: { value: [1920, 1080] },
+            timezone: { value: "UTC" },
+            touchSupport: { value: { maxTouchPoints: 0, touchEvent: false, touchStart: false } },
+            userAgent: { value: options.userAgent },
+            vendor: { value: "Google Inc." },
+            visitorSeed: { value: `${options.origin}|${options.countryCode}` }
+        };
+        return hashComponents(components);
+    }
+
+    async function readJsonResponse(response) {
+        const text = await response.text();
+        if (!text)
+            return null;
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            return { raw: text };
+        }
+    }
+
+    function redact(value) {
+        if (Array.isArray(value))
+            return value.map(redact);
+        if (value && "object" === typeof value) {
+            return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, MASKED_KEYS.test(key) ? "[REDACTED]" : redact(nested)]));
+        }
+        return value;
+    }
+
+    async function fetchBrandInfo(apiBase, origin, userAgent) {
+        const response = await fetch(`${apiBase}/casino/brand-info`, {
+            method: "GET",
+            headers: {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": origin,
+                "Referer": `${origin}/`,
+                "User-Agent": userAgent,
+                "x-forwarded-host": origin
+            }
+        });
+        const data = await readJsonResponse(response);
+        if (!response.ok || !data || !data.brandPrefix)
+            throw new Error(`brand-info failed with HTTP ${response.status}: ${JSON.stringify(redact(data))}`);
+        return data;
+    }
+
+    async function loginWithApi(options) {
+        const origin = normalizeOrigin(options.origin);
+        const apiBase = resolveApiBase(origin, options.apiPath);
+        const login = options.login;
+        const password = options.password;
+        if (!login || !password)
+            throw new Error("Missing login or password. Set LOGIN_EMAIL and LOGIN_PASSWORD, or pass --login and --password.");
+        const brandInfo = await fetchBrandInfo(apiBase, origin, options.userAgent);
+        const fingerprint = options.fingerprint || generateFingerprint({
+            origin,
+            countryCode: options.countryCode,
+            userAgent: options.userAgent
+        });
+        const headers = {
+            "Accept": "application/json",
+            "Authorization": "Bearer ",
+            "Content-Type": "application/json",
+            "Origin": origin,
+            "Referer": `${origin}/`,
+            "User-Agent": options.userAgent,
+            "refresh_token": "",
+            "x-brand-prefix": brandInfo.brandPrefix,
+            "x-country-code": options.countryCode,
+            "x-fingerprint": fingerprint,
+            "x-forwarded-host": origin
+        };
+        const response = await fetch(`${apiBase}/auth/sign-in/client`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                login,
+                password
+            })
+        });
+        const data = await readJsonResponse(response);
+        return {
+            ok: response.ok,
+            status: response.status,
+            apiBase,
+            endpoint: `${apiBase}/auth/sign-in/client`,
+            brandPrefix: brandInfo.brandPrefix,
+            fingerprint,
+            requestBody: {
+                login,
+                password: "[REDACTED]"
+            },
+            response: redact(data)
+        };
+    }
+
+    (async () => {
+        const result = await loginWithApi(parseLoginArgs(process.argv.slice(2)));
+        console.log(JSON.stringify(result, null, 2));
+        process.exitCode = result.ok ? 0 : 2;
+    })().catch((error) => {
+        console.error(JSON.stringify({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error)
+        }, null, 2));
+        process.exitCode = 1;
+    });
+} else
 ( () => {
     var e = {
         51: (e, t, n) => {

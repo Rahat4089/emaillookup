@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--origin", default=os.environ.get("LOGIN_ORIGIN", "https://cawabanga.com"))
     parser.add_argument("--api-path", default=os.environ.get("LOGIN_API_PATH", "/api/v1"))
     parser.add_argument("--country-code", default=os.environ.get("LOGIN_COUNTRY_CODE", "BN"))
+    parser.add_argument("--type", default=os.environ.get("LOGIN_TYPE", "email"))
     parser.add_argument("--email", default=os.environ.get("LOGIN_EMAIL") or os.environ.get("LOGIN_USER"))
     parser.add_argument("--password", default=os.environ.get("LOGIN_PASSWORD"))
     parser.add_argument("--fingerprint", default=os.environ.get("LOGIN_FINGERPRINT"))
@@ -54,6 +55,8 @@ def main() -> int:
         args.api_path,
         "--country-code",
         args.country_code,
+        "--type",
+        args.type,
     ]
     if args.fingerprint:
         command.extend(["--fingerprint", args.fingerprint])

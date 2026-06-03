@@ -15,6 +15,7 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             login: process.env.LOGIN_EMAIL || process.env.LOGIN_USER || "",
             password: process.env.LOGIN_PASSWORD || "",
             fingerprint: process.env.LOGIN_FINGERPRINT || "",
+            type: process.env.LOGIN_TYPE || "email",
             userAgent: process.env.LOGIN_USER_AGENT || DEFAULT_USER_AGENT
         };
         for (let i = 0; i < argv.length; i += 1) {
@@ -35,6 +36,8 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
                 args.password = value;
             else if ("fingerprint" === key)
                 args.fingerprint = value;
+            else if ("type" === key)
+                args.type = value;
             else if ("user-agent" === key)
                 args.userAgent = value;
         }
@@ -236,7 +239,8 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             headers,
             body: JSON.stringify({
                 login,
-                password
+                password,
+                type: options.type || "email"
             })
         });
         const data = await readJsonResponse(response);
@@ -249,7 +253,8 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             fingerprint,
             requestBody: {
                 login: "[REDACTED]",
-                password: "[REDACTED]"
+                password: "[REDACTED]",
+                type: options.type || "email"
             },
             response: redact(data)
         };

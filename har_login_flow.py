@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import sys
 import uuid
@@ -12,41 +13,65 @@ from urllib import error, parse, request
 LOGIN_ENDPOINT = "https://elon.casino/api/v1/auth/sign-in/client"
 HARDCODED_EMAIL = "your_email@example.com"
 HARDCODED_PASSWORD = "your_password_here"
+HARDCODED_USERNAME = ""  # optional; if empty, script uses email prefix
 COUNTRY_CODE = "BN"
+
+
+class BrowserSession:
+    def __init__(self) -> None:
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = request.build_opener(request.HTTPCookieProcessor(self.cookie_jar))
+
+    def http_json(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        payload: dict[str, object] | None = None,
+        timeout: int = 30,
+    ) -> tuple[int, dict[str, str], str]:
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+
+        req = request.Request(url=url, method=method.upper(), data=body)
+        req.add_header(
+            "User-Agent",
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/141.0.0.0 Safari/537.36"
+            ),
+        )
+        req.add_header("Accept", "application/json, text/plain, */*")
+        if headers:
+            for key, value in headers.items():
+                req.add_header(key, value)
+
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return resp.status, dict(resp.headers.items()), raw
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            return exc.code, dict(exc.headers.items()), raw
 
 
 def http_json(
     method: str,
     url: str,
+    session: BrowserSession,
     headers: dict[str, str] | None = None,
     payload: dict[str, object] | None = None,
     timeout: int = 30,
 ) -> tuple[int, dict[str, str], str]:
-    body = None
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-
-    req = request.Request(url=url, method=method.upper(), data=body)
-    req.add_header(
-        "User-Agent",
-        (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/141.0.0.0 Safari/537.36"
-        ),
+    return session.http_json(
+        method=method,
+        url=url,
+        headers=headers,
+        payload=payload,
+        timeout=timeout,
     )
-    req.add_header("Accept", "application/json, text/plain, */*")
-    if headers:
-        for key, value in headers.items():
-            req.add_header(key, value)
-
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return resp.status, dict(resp.headers.items()), raw
-    except error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        return exc.code, dict(exc.headers.items()), raw
 
 
 def pretty_json_or_raw(text: str) -> str:
@@ -57,7 +82,9 @@ def pretty_json_or_raw(text: str) -> str:
         return text
 
 
-def fetch_brand_prefix(origin: str, country_code: str | None) -> str | None:
+def fetch_brand_prefix(
+    origin: str, country_code: str | None, session: BrowserSession
+) -> str | None:
     brand_info_url = f"{origin}/api/v1/casino/brand-info"
     headers: dict[str, str] = {
         "Content-Type": "application/json",
@@ -68,7 +95,7 @@ def fetch_brand_prefix(origin: str, country_code: str | None) -> str | None:
     if country_code:
         headers["x-country-code"] = country_code
 
-    status, _, body = http_json("GET", brand_info_url, headers=headers)
+    status, _, body = http_json("GET", brand_info_url, session=session, headers=headers)
     if status != 200:
         return None
     try:
@@ -91,12 +118,20 @@ def run_login_flow() -> int:
         print("HARDCODED_EMAIL and HARDCODED_PASSWORD must be set.", file=sys.stderr)
         return 2
 
-    brand_prefix = fetch_brand_prefix(origin, COUNTRY_CODE)
+    session = BrowserSession()
+    # Warm up cookies/session similar to browser flow.
+    session.http_json("GET", f"{origin}/")
+    session.http_json("GET", f"{origin}/casino/profile/account")
+
+    brand_prefix = fetch_brand_prefix(origin, COUNTRY_CODE, session=session)
+    username = HARDCODED_USERNAME or HARDCODED_EMAIL.split("@", 1)[0]
 
     shared_headers: dict[str, str] = {
         "Content-Type": "application/json",
         "x-forwarded-host": origin,
         "x-fingerprint": uuid.uuid4().hex,
+        "refresh_token": "",
+        "Authorization": "Bearer ",
         "Referer": f"{origin}/",
         "Origin": origin,
     }
@@ -105,33 +140,50 @@ def run_login_flow() -> int:
     if brand_prefix:
         shared_headers["x-brand-prefix"] = str(brand_prefix)
 
-    payload = {
-        "type": "email",
-        "email": HARDCODED_EMAIL,
-        "password": HARDCODED_PASSWORD,
-    }
+    payload_attempts = [
+        {"type": "email", "email": HARDCODED_EMAIL, "password": HARDCODED_PASSWORD},
+        {
+            "type": "quick",
+            "email": HARDCODED_EMAIL,
+            "username": username,
+            "password": HARDCODED_PASSWORD,
+        },
+        {
+            "type": "quick",
+            "email": HARDCODED_EMAIL,
+            "username": username,
+            "login": username,
+            "password": HARDCODED_PASSWORD,
+        },
+    ]
 
     print()
-    print("=== Login Request ===")
-    print(f"POST {login_url}")
-    print("Request payload keys:", ", ".join(payload.keys()))
-    status, resp_headers, resp_body = http_json(
-        "POST", login_url, headers=shared_headers, payload=payload
-    )
-    print(f"Status: {status}")
-    print("Response headers (subset):")
-    for key in ("content-type", "set-cookie", "server"):
-        if key in {k.lower() for k in resp_headers}:
-            for hdr_key, hdr_val in resp_headers.items():
-                if hdr_key.lower() == key:
-                    print(f"  {hdr_key}: {hdr_val}")
-    print("Response body:")
-    print(pretty_json_or_raw(resp_body))
+    print("=== Login Attempts ===")
+    for idx, payload in enumerate(payload_attempts, start=1):
+        print(f"\nAttempt {idx}: POST {login_url}")
+        print("Request payload keys:", ", ".join(payload.keys()))
+        status, resp_headers, resp_body = http_json(
+            "POST", login_url, session=session, headers=shared_headers, payload=payload
+        )
+        print(f"Status: {status}")
+        print("Response headers (subset):")
+        for key in ("content-type", "set-cookie", "server"):
+            if key in {k.lower() for k in resp_headers}:
+                for hdr_key, hdr_val in resp_headers.items():
+                    if hdr_key.lower() == key:
+                        print(f"  {hdr_key}: {hdr_val}")
+        print("Response body:")
+        print(pretty_json_or_raw(resp_body))
+        if 200 <= status < 300:
+            print("\nLogin succeeded.")
+            return 0
 
-    if 200 <= status < 300:
-        print("\nLogin succeeded.")
-        return 0
     print("\nLogin failed.")
+    print(
+        "Note: main.js also authenticates through websocket command x02 "
+        "(at1/at2 payload). If all HTTP attempts return 401, this account may "
+        "require the websocket auth flow instead of /auth/sign-in/client."
+    )
     return 1
 
 

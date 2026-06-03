@@ -221,6 +221,16 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             countryCode: options.countryCode,
             userAgent: options.userAgent
         });
+        const loginType = options.type || "email";
+        const body = "email" === loginType ? {
+            email: login,
+            password,
+            type: loginType
+        } : {
+            login,
+            password,
+            type: loginType
+        };
         const headers = {
             "Accept": "application/json",
             "Authorization": "Bearer ",
@@ -237,11 +247,7 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
         const response = await fetch(`${apiBase}/auth/sign-in/client`, {
             method: "POST",
             headers,
-            body: JSON.stringify({
-                login,
-                password,
-                type: options.type || "email"
-            })
+            body: JSON.stringify(body)
         });
         const data = await readJsonResponse(response);
         return {
@@ -254,7 +260,7 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             requestBody: {
                 login: "[REDACTED]",
                 password: "[REDACTED]",
-                type: options.type || "email"
+                type: loginType
             },
             response: redact(data)
         };

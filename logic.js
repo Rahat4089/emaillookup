@@ -4,7 +4,7 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
     const DEFAULT_API_PATH = "/api/v1";
     const DEFAULT_COUNTRY_CODE = "BN";
     const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-    const MASKED_KEYS = /(^|_|-)(access|refresh|id)?token($|_|-)|password|secret|authorization/i;
+    const MASKED_KEYS = /(^|_|-)(access|refresh|id)?token($|_|-)|password|secret|authorization|(^|_|-)(email|login)($|_|-)/i;
     const UINT64_MASK = (1n << 64n) - 1n;
 
     function parseLoginArgs(argv) {
@@ -248,7 +248,7 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             brandPrefix: brandInfo.brandPrefix,
             fingerprint,
             requestBody: {
-                login,
+                login: "[REDACTED]",
                 password: "[REDACTED]"
             },
             response: redact(data)

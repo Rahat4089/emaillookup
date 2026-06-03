@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze a HAR file for login flow and execute login request."""
+"""Extract login endpoint from main.js and perform sign-in."""
 
 from __future__ import annotations
 
@@ -9,36 +9,26 @@ import json
 import re
 import sys
 import uuid
-from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
 
 
-def load_har(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def find_main_js_text(entries: list[dict[str, Any]]) -> str:
-    for entry in entries:
-        req = entry.get("request", {})
-        url = req.get("url", "")
-        if "/static/js/main." in url and url.endswith(".js"):
-            return entry.get("response", {}).get("content", {}).get("text", "") or ""
-    return ""
-
-
-def infer_origin(entries: list[dict[str, Any]]) -> str:
-    for entry in entries:
-        url = entry.get("request", {}).get("url", "")
-        parsed = parse.urlparse(url)
-        if parsed.scheme in {"http", "https"} and parsed.netloc:
-            return f"{parsed.scheme}://{parsed.netloc}"
-    raise RuntimeError("Could not infer origin from HAR entries.")
+def fetch_text(url: str, timeout: int = 30) -> str:
+    req = request.Request(url=url, method="GET")
+    req.add_header(
+        "User-Agent",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/141.0.0.0 Safari/537.36"
+        ),
+    )
+    req.add_header("Accept", "*/*")
+    with request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 def infer_api_base(js_text: str) -> str:
-    # App init call contains baseUrl, e.g. baseUrl:"/api/v1"
     candidates = re.findall(r'baseUrl:"(/api/[^"]+)"', js_text)
     for candidate in candidates:
         if candidate.startswith("/api/"):
@@ -51,61 +41,46 @@ def infer_country_code(js_text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def find_captured_brand_prefix(entries: list[dict[str, Any]]) -> str | None:
-    for entry in entries:
-        url = entry.get("request", {}).get("url", "")
-        if url.endswith("/api/v1/casino/brand-info"):
-            text = entry.get("response", {}).get("content", {}).get("text", "")
-            if not text:
-                continue
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            brand_prefix = payload.get("brandPrefix")
-            if isinstance(brand_prefix, str) and brand_prefix:
-                return brand_prefix
-    return None
+def infer_login_path(js_text: str) -> str:
+    auth_paths = sorted(set(re.findall(r"/auth/[a-z0-9/_-]+", js_text)))
+    if "/auth/sign-in/client" in auth_paths:
+        return "/auth/sign-in/client"
+
+    preferred = (
+        "/auth/sign-in",
+        "/auth/signin",
+        "/auth/login",
+    )
+    for path in preferred:
+        if path in auth_paths:
+            return path
+
+    for path in auth_paths:
+        if "sign-in" in path or "signin" in path or "login" in path:
+            return path
+
+    raise RuntimeError("Could not infer login endpoint from main.js")
 
 
-def analyze_login_flow(har_data: dict[str, Any]) -> dict[str, Any]:
-    entries = har_data.get("log", {}).get("entries", [])
-    if not isinstance(entries, list) or not entries:
-        raise RuntimeError("HAR has no entries.")
+def extract_origin(js_url: str) -> str:
+    parsed = parse.urlparse(js_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("Invalid JS URL. Expected full https:// URL.")
+    return f"{parsed.scheme}://{parsed.netloc}"
 
-    main_js_text = find_main_js_text(entries)
-    origin = infer_origin(entries)
-    api_base = infer_api_base(main_js_text)
-    country_code = infer_country_code(main_js_text)
 
-    network_login_requests = []
-    auth_keywords = ("login", "sign-in", "signin", "auth")
-    for entry in entries:
-        req = entry.get("request", {})
-        url = req.get("url", "").lower()
-        if any(keyword in url for keyword in auth_keywords):
-            network_login_requests.append(
-                {
-                    "method": req.get("method", "GET"),
-                    "url": req.get("url", ""),
-                    "status": entry.get("response", {}).get("status"),
-                }
-            )
-
-    js_auth_paths = sorted(set(re.findall(r"/auth/[a-z0-9/_-]+", main_js_text)))
-    login_path = "/auth/sign-in/client" if "/auth/sign-in/client" in js_auth_paths else None
-    token_path = "/auth/sign-in/token" if "/auth/sign-in/token" in js_auth_paths else None
-    brand_prefix = find_captured_brand_prefix(entries)
+def analyze_main_js(js_url: str) -> dict[str, Any]:
+    js_text = fetch_text(js_url)
+    origin = extract_origin(js_url)
+    api_base = infer_api_base(js_text)
+    login_path = infer_login_path(js_text)
+    country_code = infer_country_code(js_text)
 
     return {
         "origin": origin,
         "api_base": api_base,
-        "country_code": country_code,
-        "network_auth_requests": network_login_requests,
-        "js_auth_paths": js_auth_paths,
         "login_path": login_path,
-        "token_path": token_path,
-        "captured_brand_prefix": brand_prefix,
+        "country_code": country_code,
     }
 
 
@@ -121,6 +96,15 @@ def http_json(
         body = json.dumps(payload).encode("utf-8")
 
     req = request.Request(url=url, method=method.upper(), data=body)
+    req.add_header(
+        "User-Agent",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/141.0.0.0 Safari/537.36"
+        ),
+    )
+    req.add_header("Accept", "application/json, text/plain, */*")
     if headers:
         for key, value in headers.items():
             req.add_header(key, value)
@@ -142,25 +126,41 @@ def pretty_json_or_raw(text: str) -> str:
         return text
 
 
+def fetch_brand_prefix(origin: str, api_base: str, country_code: str | None) -> str | None:
+    brand_info_url = f"{origin}{api_base}/casino/brand-info"
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "x-forwarded-host": origin,
+        "Referer": f"{origin}/",
+        "Origin": origin,
+    }
+    if country_code:
+        headers["x-country-code"] = country_code
+
+    status, _, body = http_json("GET", brand_info_url, headers=headers)
+    if status != 200:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+    brand_prefix = payload.get("brandPrefix")
+    if isinstance(brand_prefix, str) and brand_prefix:
+        return brand_prefix
+    return None
+
+
 def run_login_flow(analysis: dict[str, Any]) -> int:
     origin = analysis["origin"]
     api_base = analysis["api_base"]
-    login_path = analysis["login_path"] or "/auth/sign-in/client"
+    login_path = analysis["login_path"]
     country_code = analysis["country_code"]
 
-    print("=== HAR Login Flow Analysis ===")
+    print("=== Login Endpoint Extraction ===")
     print(f"Origin: {origin}")
     print(f"API base: {api_base}")
-    print(f"Inferred login endpoint: {api_base}{login_path}")
-    if analysis["network_auth_requests"]:
-        print("Auth-related requests captured in network:")
-        for req in analysis["network_auth_requests"]:
-            print(f"  - {req['method']} {req['url']} (status={req['status']})")
-    else:
-        print(
-            "No direct login request captured in HAR network entries. "
-            "Using login endpoint inferred from JS bundle."
-        )
+    print(f"Login endpoint: {api_base}{login_path}")
     print()
 
     email = input("Email (or username): ").strip()
@@ -169,82 +169,63 @@ def run_login_flow(analysis: dict[str, Any]) -> int:
         print("Email and password are required.", file=sys.stderr)
         return 2
 
-    brand_info_url = f"{origin}{api_base}/casino/brand-info"
     login_url = f"{origin}{api_base}{login_path}"
-    x_fingerprint = uuid.uuid4().hex
+    brand_prefix = fetch_brand_prefix(origin, api_base, country_code)
 
     shared_headers: dict[str, str] = {
         "Content-Type": "application/json",
         "x-forwarded-host": origin,
-        "x-fingerprint": x_fingerprint,
+        "x-fingerprint": uuid.uuid4().hex,
+        "Referer": f"{origin}/",
+        "Origin": origin,
     }
     if country_code:
         shared_headers["x-country-code"] = country_code
-
-    print(f"Fetching brand info: {brand_info_url}")
-    brand_status, _, brand_body = http_json("GET", brand_info_url, headers=shared_headers)
-    brand_prefix = analysis.get("captured_brand_prefix")
-    if brand_status == 200:
-        try:
-            brand_prefix = json.loads(brand_body).get("brandPrefix") or brand_prefix
-        except json.JSONDecodeError:
-            pass
     if brand_prefix:
         shared_headers["x-brand-prefix"] = str(brand_prefix)
 
-    payload_attempts = [
-        {"email": email, "password": password},
-        {"login": email, "password": password},
-        {"login": email, "email": email, "password": password},
-    ]
+    payload = {"type": "email", "email": email, "password": password}
 
     print()
-    print("=== Login Attempts ===")
-    for idx, payload in enumerate(payload_attempts, start=1):
-        print(f"\nAttempt {idx}: POST {login_url}")
-        print("Request payload keys:", ", ".join(payload.keys()))
-        status, resp_headers, resp_body = http_json(
-            "POST", login_url, headers=shared_headers, payload=payload
-        )
-        print(f"Status: {status}")
-        print("Response headers (subset):")
-        for key in ("content-type", "set-cookie", "server"):
-            if key in {k.lower() for k in resp_headers}:
-                for hdr_key, hdr_val in resp_headers.items():
-                    if hdr_key.lower() == key:
-                        print(f"  {hdr_key}: {hdr_val}")
-        print("Response body:")
-        print(pretty_json_or_raw(resp_body))
+    print("=== Login Request ===")
+    print(f"POST {login_url}")
+    print("Request payload keys:", ", ".join(payload.keys()))
+    status, resp_headers, resp_body = http_json(
+        "POST", login_url, headers=shared_headers, payload=payload
+    )
+    print(f"Status: {status}")
+    print("Response headers (subset):")
+    for key in ("content-type", "set-cookie", "server"):
+        if key in {k.lower() for k in resp_headers}:
+            for hdr_key, hdr_val in resp_headers.items():
+                if hdr_key.lower() == key:
+                    print(f"  {hdr_key}: {hdr_val}")
+    print("Response body:")
+    print(pretty_json_or_raw(resp_body))
 
-        if 200 <= status < 300:
-            print("\nLogin succeeded with this payload.")
-            return 0
-
-    print("\nAll payload attempts failed.")
+    if 200 <= status < 300:
+        print("\nLogin succeeded.")
+        return 0
+    print("\nLogin failed.")
     return 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Analyze HAR login flow and attempt login by prompting email/password."
-        )
+        description="Extract endpoint from main.js and perform login."
     )
     parser.add_argument(
-        "--har",
-        default="elon.casino.har",
-        help="Path to HAR file (default: elon.casino.har)",
+        "--js-url",
+        default="https://elon.casino/casino/static/js/main.101751d4.js",
+        help=(
+            "Main JS URL to analyze "
+            "(default: https://elon.casino/casino/static/js/main.101751d4.js)"
+        ),
     )
     args = parser.parse_args()
 
-    har_path = Path(args.har)
-    if not har_path.exists():
-        print(f"HAR file not found: {har_path}", file=sys.stderr)
-        return 2
-
     try:
-        har_data = load_har(har_path)
-        analysis = analyze_login_flow(har_data)
+        analysis = analyze_main_js(args.js_url)
         return run_login_flow(analysis)
     except KeyboardInterrupt:
         print("\nCancelled by user.")

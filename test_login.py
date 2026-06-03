@@ -23,6 +23,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Test the login API flow from logic.js")
     parser.add_argument("--origin", default=os.environ.get("LOGIN_ORIGIN", "https://cawabanga.com"))
     parser.add_argument("--api-path", default=os.environ.get("LOGIN_API_PATH", "/api/v1"))
+    parser.add_argument("--transport", default=os.environ.get("LOGIN_TRANSPORT", "socket"))
+    parser.add_argument("--language", default=os.environ.get("LOGIN_LANGUAGE", "en"))
+    parser.add_argument("--socket-url", default=os.environ.get("LOGIN_SOCKET_URL"))
+    parser.add_argument("--socket-timeout-ms", default=os.environ.get("LOGIN_SOCKET_TIMEOUT_MS", "15000"))
     parser.add_argument("--country-code", default=os.environ.get("LOGIN_COUNTRY_CODE", "BN"))
     parser.add_argument("--type", default=os.environ.get("LOGIN_TYPE", "email"))
     parser.add_argument("--email", default=os.environ.get("LOGIN_EMAIL") or os.environ.get("LOGIN_USER"))
@@ -53,6 +57,12 @@ def main() -> int:
         args.origin,
         "--api-path",
         args.api_path,
+        "--transport",
+        args.transport,
+        "--language",
+        args.language,
+        "--socket-timeout-ms",
+        str(args.socket_timeout_ms),
         "--country-code",
         args.country_code,
         "--type",
@@ -60,6 +70,8 @@ def main() -> int:
     ]
     if args.fingerprint:
         command.extend(["--fingerprint", args.fingerprint])
+    if args.socket_url:
+        command.extend(["--socket-url", args.socket_url])
     if args.user_agent:
         command.extend(["--user-agent", args.user_agent])
 

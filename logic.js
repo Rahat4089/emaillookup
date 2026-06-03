@@ -3,6 +3,8 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
     const DEFAULT_ORIGIN = "https://cawabanga.com";
     const DEFAULT_API_PATH = "/api/v1";
     const DEFAULT_COUNTRY_CODE = "BN";
+    const DEFAULT_LANGUAGE = "en";
+    const DEFAULT_TRANSPORT = "socket";
     const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
     const MASKED_KEYS = /(^|_|-)(access|refresh|id)?token($|_|-)|password|secret|authorization|(^|_|-)(email|login)($|_|-)/i;
     const UINT64_MASK = (1n << 64n) - 1n;
@@ -12,9 +14,13 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
             origin: process.env.LOGIN_ORIGIN || DEFAULT_ORIGIN,
             apiPath: process.env.LOGIN_API_PATH || DEFAULT_API_PATH,
             countryCode: process.env.LOGIN_COUNTRY_CODE || DEFAULT_COUNTRY_CODE,
+            language: process.env.LOGIN_LANGUAGE || DEFAULT_LANGUAGE,
+            transport: process.env.LOGIN_TRANSPORT || DEFAULT_TRANSPORT,
             login: process.env.LOGIN_EMAIL || process.env.LOGIN_USER || "",
             password: process.env.LOGIN_PASSWORD || "",
             fingerprint: process.env.LOGIN_FINGERPRINT || "",
+            socketUrl: process.env.LOGIN_SOCKET_URL || "",
+            socketTimeoutMs: Number(process.env.LOGIN_SOCKET_TIMEOUT_MS || 15e3),
             type: process.env.LOGIN_TYPE || "email",
             userAgent: process.env.LOGIN_USER_AGENT || DEFAULT_USER_AGENT
         };
@@ -30,12 +36,20 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
                 args.apiPath = value;
             else if ("country-code" === key || "country" === key)
                 args.countryCode = value;
+            else if ("language" === key || "lang" === key)
+                args.language = value;
+            else if ("transport" === key)
+                args.transport = value;
             else if ("login" === key || "email" === key)
                 args.login = value;
             else if ("password" === key)
                 args.password = value;
             else if ("fingerprint" === key)
                 args.fingerprint = value;
+            else if ("socket-url" === key)
+                args.socketUrl = value;
+            else if ("socket-timeout-ms" === key)
+                args.socketTimeoutMs = Number(value);
             else if ("type" === key)
                 args.type = value;
             else if ("user-agent" === key)
@@ -252,6 +266,7 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
         const data = await readJsonResponse(response);
         return {
             ok: response.ok,
+            transport: "rest",
             status: response.status,
             apiBase,
             endpoint: `${apiBase}/auth/sign-in/client`,
@@ -266,9 +281,271 @@ if ("undefined" !== typeof process && process.versions && process.versions.node 
         };
     }
 
+    function fromSocketUTF8(value) {
+        value = String(value).replace(/\r\n/g, "\n");
+        let result = "";
+        for (let i = 0; i < value.length; i += 1) {
+            const code = value.charCodeAt(i);
+            if (code < 128)
+                result += String.fromCharCode(code);
+            else if (code < 2048)
+                result += String.fromCharCode(code >> 6 | 192, 63 & code | 128);
+            else
+                result += String.fromCharCode(code >> 12 | 224, code >> 6 & 63 | 128, 63 & code | 128);
+        }
+        return result;
+    }
+
+    function encodeSocketByte(value) {
+        return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[value % 64];
+    }
+
+    function encodeSocketBase64(bytes) {
+        bytes.push(0);
+        let index = 0;
+        let output = "";
+        for (; index < bytes.length - 1; ) {
+            output += encodeSocketByte(Math.floor(bytes[index] / 4));
+            output += encodeSocketByte(16 * bytes[index] | Math.floor(bytes[index + 1] / 16));
+            output += index + 1 < bytes.length - 1 ? encodeSocketByte(4 * bytes[index + 1] | Math.floor(bytes[index + 2] / 64)) : "=";
+            output += index + 2 < bytes.length - 1 ? encodeSocketByte(bytes[index + 2]) : "=";
+            index += 3;
+        }
+        return output;
+    }
+
+    function writeSocketByte(bytes, value) {
+        if (value < 0)
+            value = 256 + value;
+        bytes.push(value & 255);
+    }
+
+    function writeSocketShort(bytes, value) {
+        if (value < 0)
+            value = 65536 + value;
+        bytes.push(value & 255, Math.floor(value / 256) & 255);
+    }
+
+    function writeSocketUTF(bytes, value) {
+        const utf = fromSocketUTF8(value);
+        writeSocketShort(bytes, utf.length);
+        for (let i = 0; i < utf.length; i += 1)
+            bytes.push(utf.charCodeAt(i));
+    }
+
+    function buildClientLoginFrame(options) {
+        const bytes = [];
+        writeSocketUTF(bytes, options.login);
+        writeSocketUTF(bytes, options.password);
+        writeSocketUTF(bytes, options.location);
+        writeSocketByte(bytes, options.timeZone);
+        writeSocketUTF(bytes, options.language);
+        writeSocketUTF(bytes, options.userAgent);
+        writeSocketByte(bytes, options.appType);
+        writeSocketByte(bytes, options.requestId);
+        return `clientlogin${encodeSocketBase64(bytes)}`;
+    }
+
+    async function fetchSocketAddress(origin, language, explicitSocketUrl) {
+        if (explicitSocketUrl)
+            return explicitSocketUrl;
+        let address = "";
+        try {
+            const response = await fetch(`${origin}/casino/configs/themes/2/web.json`, {
+                method: "GET",
+                cache: "no-cache",
+                headers: {
+                    "Accept": "application/json",
+                    "User-Agent": DEFAULT_USER_AGENT
+                }
+            });
+            const data = response.ok ? await readJsonResponse(response) : null;
+            address = data && data.transport && data.transport.address ? data.transport.address : "";
+        } catch (error) {}
+        if (!address) {
+            const host = new URL(origin).host;
+            address = `wss://wss.${host}/casino`;
+        }
+        return `${address.replace(/\/+$/, "")}/${language}`;
+    }
+
+    function byteSummary(data) {
+        return Array.from(data.slice(0, Math.min(data.length, 24)));
+    }
+
+    function decodeSocketAuthStatus(data) {
+        if (!data.length)
+            return null;
+        let key = null;
+        let payload = null;
+        let compressed = false;
+        if (1 === data[0]) {
+            key = data[1];
+            payload = data.subarray(3);
+        } else {
+            compressed = true;
+            try {
+                const zlib = require("zlib");
+                const decoded = new Uint8Array(zlib.brotliDecompressSync(Buffer.from(data)));
+                key = decoded[0];
+                payload = decoded.subarray(2);
+            } catch (error) {
+                return {
+                    compressed,
+                    decodeError: error instanceof Error ? error.message : String(error)
+                };
+            }
+        }
+        const result = {
+            key,
+            compressed,
+            payloadLength: payload.length
+        };
+        if (3 === key && payload.length >= 2) {
+            result.requestId = payload[0];
+            result.status = payload[1] > 127 ? payload[1] - 256 : payload[1];
+            result.authEvent = result.status ? "authorizationFail" : "authorizationSuccess";
+        }
+        return result;
+    }
+
+    async function toSocketBytes(eventData) {
+        if (eventData instanceof ArrayBuffer)
+            return new Uint8Array(eventData);
+        if (eventData && "function" === typeof eventData.arrayBuffer)
+            return new Uint8Array(await eventData.arrayBuffer());
+        return new Uint8Array(Buffer.from(String(eventData)));
+    }
+
+    async function loginWithSocket(options) {
+        const origin = normalizeOrigin(options.origin);
+        const login = options.login;
+        const password = options.password;
+        if (!login || !password)
+            throw new Error("Missing login or password. Set LOGIN_EMAIL and LOGIN_PASSWORD, or pass --login and --password.");
+        if ("function" !== typeof WebSocket)
+            throw new Error("This Node runtime does not provide WebSocket.");
+        const language = options.language || DEFAULT_LANGUAGE;
+        const socketUrl = await fetchSocketAddress(origin, language, options.socketUrl);
+        const request = {
+            login,
+            password,
+            location: `${origin}/`,
+            timeZone: Math.floor((new Date).getTimezoneOffset() / -60),
+            language,
+            userAgent: options.userAgent,
+            appType: 2,
+            requestId: 3
+        };
+        const frame = buildClientLoginFrame(request);
+        return await new Promise((resolve) => {
+            let settled = false;
+            const finish = (result) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                try {
+                    socket.close();
+                } catch (error) {}
+                resolve(result);
+            };
+            const timer = setTimeout((() => finish({
+                ok: false,
+                transport: "socket",
+                status: "SOCKET_TIMEOUT",
+                socketUrl,
+                requestCommand: "clientlogin",
+                requestBody: {
+                    login: "[REDACTED]",
+                    password: "[REDACTED]",
+                    language,
+                    requestId: 3
+                }
+            })), options.socketTimeoutMs || 15e3);
+            const socket = new WebSocket(socketUrl);
+            socket.binaryType = "arraybuffer";
+            socket.addEventListener("open", (() => {
+                socket.send(frame);
+            }));
+            socket.addEventListener("message", (async (event) => {
+                const data = await toSocketBytes(event.data);
+                const decoded = decodeSocketAuthStatus(data);
+                finish({
+                    ok: Boolean(decoded && "authorizationSuccess" === decoded.authEvent),
+                    transport: "socket",
+                    status: decoded && decoded.authEvent ? decoded.authEvent : "SOCKET_MESSAGE",
+                    socketUrl,
+                    requestCommand: "clientlogin",
+                    frameLength: frame.length,
+                    responseBytes: data.length,
+                    responseHead: byteSummary(data),
+                    decoded,
+                    requestBody: {
+                        login: "[REDACTED]",
+                        password: "[REDACTED]",
+                        language,
+                        requestId: 3
+                    }
+                });
+            }));
+            socket.addEventListener("error", ((event) => finish({
+                ok: false,
+                transport: "socket",
+                status: "SOCKET_ERROR",
+                socketUrl,
+                requestCommand: "clientlogin",
+                message: event && (event.message || event.type) || "WebSocket error",
+                requestBody: {
+                    login: "[REDACTED]",
+                    password: "[REDACTED]",
+                    language,
+                    requestId: 3
+                }
+            })));
+            socket.addEventListener("close", ((event) => {
+                if (!settled)
+                    finish({
+                        ok: false,
+                        transport: "socket",
+                        status: "SOCKET_CLOSED",
+                        socketUrl,
+                        closeCode: event.code,
+                        closeReason: event.reason,
+                        requestCommand: "clientlogin",
+                        requestBody: {
+                            login: "[REDACTED]",
+                            password: "[REDACTED]",
+                            language,
+                            requestId: 3
+                        }
+                    });
+            }));
+        });
+    }
+
+    async function runLoginTest(options) {
+        const transport = (options.transport || DEFAULT_TRANSPORT).toLowerCase();
+        if ("rest" === transport)
+            return loginWithApi(options);
+        if ("socket" === transport || "websocket" === transport || "ws" === transport)
+            return loginWithSocket(options);
+        if ("both" === transport) {
+            const socket = await loginWithSocket(options);
+            const rest = await loginWithApi(options);
+            return {
+                ok: socket.ok || rest.ok,
+                transport: "both",
+                socket,
+                rest
+            };
+        }
+        throw new Error(`Unknown transport: ${options.transport}`);
+    }
+
     (async () => {
-        const result = await loginWithApi(parseLoginArgs(process.argv.slice(2)));
-        console.log(JSON.stringify(result, null, 2));
+        const result = await runLoginTest(parseLoginArgs(process.argv.slice(2)));
+        console.log(JSON.stringify(redact(result), null, 2));
         process.exitCode = result.ok ? 0 : 2;
     })().catch((error) => {
         console.error(JSON.stringify({
